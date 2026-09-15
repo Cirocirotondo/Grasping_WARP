@@ -64,7 +64,7 @@ from simtoolreal_newton.envs.cuboid_symmetry import (
 )
 from simtoolreal_newton.envs.demonstration import JointDemonstration60Hz
 from simtoolreal_newton.envs.disturbance import sample_impulses
-from simtoolreal_newton.envs.domain_randomization import DomainRandomization
+from simtoolreal_newton.envs.domain_randomization import DomainRandomization, UNAPPLIED_PARAMETERS
 from simtoolreal_newton.envs.keypoints import (
     hand_keypoints,
     keypoint_gaussian,
@@ -243,6 +243,7 @@ class MotionImitationEnv(DirectRLEnv):
             getattr(acfg, "domain_randomization", object()),
             int(acfg.env.num_envs),
             seed=int(getattr(acfg, "seed", 0) or 0),
+            unapplied=UNAPPLIED_PARAMETERS,
         )
         contact = acfg.contact
         self.contact_enabled = bool(contact.enabled)
@@ -701,12 +702,13 @@ class MotionImitationEnv(DirectRLEnv):
         if bool(torch.any(link_scale != 1.0)):
             robot_mass = self.robot.data.default_mass.torch.to(self.device)
             self.robot.set_masses_index(masses=(robot_mass * link_scale.view(n, 1)).contiguous())
-        for key in ("fingertip_friction", "object_friction", "table_friction"):
+        for key in UNAPPLIED_PARAMETERS:
             values = [randomization.multiplier(key, i) for i in range(n)]
             if any(abs(v - 1.0) > 1e-9 for v in values):
                 logger.warning(
                     "domain_randomization.%s is not applied on the Isaac Lab port yet (per-environment "
-                    "friction needs solver-side material writes); every environment keeps the nominal value.",
+                    "friction needs solver-side material writes); every environment keeps the nominal value "
+                    "and the critic is not told about this parameter.",
                     key,
                 )
 
@@ -1178,6 +1180,9 @@ class MotionImitationEnv(DirectRLEnv):
         # Isaac Lab bookkeeping: asset buffers, event manager, episode counter.
         DirectRLEnv._reset_idx(self, env_ids.to(torch.int32))
 
+        # Indices drawn here are in range by construction (argmin over the
+        # bank, RSI sampler); caller-supplied ones were checked above. The
+        # bank's sample() itself never reads them back to the host.
         sample = self.transform_bank.sample(transform_indices, reference_indices)
         self.reference_index[env_ids] = reference_indices
         self.transform_index[env_ids] = transform_indices
@@ -1652,8 +1657,10 @@ class MotionImitationEnv(DirectRLEnv):
         if self.object_max_angular_velocity > 0.0:
             rate = angular.norm(dim=1, keepdim=True)
             clamped[:, 3:6] = angular * (self.object_max_angular_velocity / rate.clamp_min(1e-9)).clamp(max=1.0)
-        if bool((clamped != velocity).any()):
-            self.cube.write_root_velocity_to_sim_index(root_velocity=clamped.contiguous())
+        # Written every step. Deciding on the host whether anything changed
+        # would cost a GPU->CPU synchronisation per step; writing an unchanged
+        # velocity back costs one small copy.
+        self.cube.write_root_velocity_to_sim_index(root_velocity=clamped.contiguous())
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._clamp_object_velocity()

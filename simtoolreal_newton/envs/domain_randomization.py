@@ -20,6 +20,15 @@ the population covers the range on every iteration anyway.
 import numpy as np
 
 
+# Sampled but not written to the simulator on this port: per-environment
+# friction needs solver-side material writes that Newton's MuJoCo-Warp path
+# does not expose yet. The multipliers are still drawn (so the RNG stream and
+# the other parameters match a run that has them) but they never reach the
+# critic: telling the value function that environments differ in friction
+# when they do not would be noise dressed as privilege.
+UNAPPLIED_PARAMETERS = ("fingertip_friction", "object_friction", "table_friction")
+
+
 class DomainRandomization:
     """Samples one physical configuration per environment.
 
@@ -27,9 +36,10 @@ class DomainRandomization:
     parameter, so an unrandomised run reproduces the fixed values exactly.
     """
 
-    def __init__(self, cfg, num_envs, seed=0):
+    def __init__(self, cfg, num_envs, seed=0, unapplied=()):
         self.enabled = bool(getattr(cfg, "enabled", False))
         self.num_envs = int(num_envs)
+        self.unapplied = tuple(unapplied)
         self._rng = np.random.default_rng(int(seed))
         self.ranges = {
             "arm_stiffness": float(getattr(cfg, "arm_stiffness_range", 0.0)),
@@ -66,6 +76,13 @@ class DomainRandomization:
                 raise ValueError(
                     "Randomisation range for {} must lie in [0, 1)".format(name)
                 )
+        unknown = set(self.unapplied) - set(self.ranges)
+        if unknown:
+            raise ValueError("Unknown unapplied parameters: {}".format(sorted(unknown)))
+        # The parameters the critic may be told about, in a fixed order.
+        self.critic_parameters = tuple(
+            name for name in sorted(self.ranges) if name not in self.unapplied
+        )
         self.samples = self._draw()
 
     def _draw(self):
@@ -93,7 +110,7 @@ class DomainRandomization:
         unexplained variance lands in the advantages the actor learns from.
         """
         return np.array(
-            [self.samples[name][int(env_index)] - 1.0 for name in sorted(self.ranges)],
+            [self.samples[name][int(env_index)] - 1.0 for name in self.critic_parameters],
             dtype=np.float32,
         )
 
@@ -101,7 +118,7 @@ class DomainRandomization:
     def privileged_dim(self):
         if not (self.enabled and self.critic_observes_parameters):
             return 0
-        return len(self.ranges)
+        return len(self.critic_parameters)
 
     def privileged_table(self, device=None):
         """All environments' multipliers as one (num_envs, dim) tensor."""
@@ -112,7 +129,7 @@ class DomainRandomization:
         if self.privileged_dim == 0:
             return None
         rows = np.stack(
-            [self.samples[name] - 1.0 for name in sorted(self.ranges)], axis=1
+            [self.samples[name] - 1.0 for name in self.critic_parameters], axis=1
         ).astype(np.float32)
         return torch.as_tensor(rows, device=device)
 

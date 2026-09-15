@@ -35,7 +35,7 @@ from simtoolreal_newton.envs.controller import (
     JOINT_NAMES,
     pd_gain_tables,
 )
-from simtoolreal_newton.envs.domain_randomization import DomainRandomization
+from simtoolreal_newton.envs.domain_randomization import DomainRandomization, UNAPPLIED_PARAMETERS
 
 SOURCE_URDF = ROOT_DIR / "assets" / "urdf" / "ur5e_delto_description" / "ur5e_right_dg5f_mount_60deg.urdf"
 ROBOT_URDF = ROOT_DIR / "assets" / "ur5e_right_dg5f.urdf"
@@ -320,6 +320,7 @@ def observation_dims(animrl_cfg):
         getattr(animrl_cfg, "domain_randomization", object()),
         int(animrl_cfg.env.num_envs),
         seed=int(getattr(animrl_cfg, "seed", 0) or 0),
+        unapplied=UNAPPLIED_PARAMETERS,
     )
     critic_parameter = randomization.privileged_dim
     critic = num_obs + critic_force + critic_parameter if (critic_force or critic_parameter) else 0
@@ -357,6 +358,12 @@ class MotionImitationEnvCfg(DirectRLEnvCfg):
     # Optional kit-less camera (Newton Warp raster renderer) looking at env 0,
     # for frame dumps and videos. ``None`` disables it.
     camera: Any = None
+    # The AnimRL configuration object driving the task. Set by
+    # :func:`build_env_cfg`; when None the environment builds the default
+    # :class:`SimToolRealCfg` and applies ``animrl_overrides`` (``--set``
+    # style ``path=value`` pairs) so the Hydra/CLI entry points work too.
+    animrl_cfg: Any = None
+    animrl_overrides: dict[str, Any] = {}
 
 
 def make_camera_cfg(animrl_cfg, width: int = 640, height: int = 480):
@@ -394,12 +401,6 @@ def make_camera_cfg(animrl_cfg, width: int = 640, height: int = 480):
         renderer_cfg=NewtonWarpRendererCfg(),
         update_period=0.0,
     )
-    # The AnimRL configuration object driving the task. Set by
-    # :func:`build_env_cfg`; when None the environment builds the default
-    # :class:`SimToolRealCfg` and applies ``animrl_overrides`` (``--set``
-    # style ``path=value`` pairs) so the Hydra/CLI entry points work too.
-    animrl_cfg: Any = None
-    animrl_overrides: dict[str, Any] = {}
 
 
 def build_env_cfg(animrl_cfg, num_envs: int | None = None, device: str | None = None) -> MotionImitationEnvCfg:

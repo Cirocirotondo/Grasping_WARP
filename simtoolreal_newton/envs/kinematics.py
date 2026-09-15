@@ -81,6 +81,30 @@ def _axis_angle_matrix(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
     return rot
 
 
+@dataclass(frozen=True)
+class _ChainPlan:
+    """A link's chain over a fixed joint list, folded for the batched path.
+
+    Every fixed joint, and every actuated joint that is held at zero because
+    it is not in the joint list, is a constant transform. Folding those into
+    the moving joints' origins leaves ``K`` revolute steps and one trailing
+    offset, so the per-step work is ``K`` small compositions instead of one
+    4x4 product per URDF joint plus a nine-write rotation matrix each.
+    """
+
+    offset_rotation: torch.Tensor  # (K + 1, 3, 3)
+    offset_position: torch.Tensor  # (K + 1, 3)
+    axes: torch.Tensor  # (K, 3) unit axes in their joint frames
+    skew: torch.Tensor  # (K, 3, 3) [axis]_x
+    outer: torch.Tensor  # (K, 3, 3) axis axis^T
+    columns: torch.Tensor  # (K,) column of each moving joint in the Jacobian
+    columns_are_prefix: bool  # columns == arange(K): slice instead of gather
+
+    @property
+    def moving_count(self) -> int:
+        return int(self.axes.shape[0])
+
+
 class UrdfKinematics:
     """Forward kinematics over the whole URDF tree, batched over configurations."""
 
@@ -150,6 +174,7 @@ class UrdfKinematics:
             name: joint.origin.to(device=self.device, dtype=dtype) for name, joint in joints.items()
         }
         self._axes = {name: joint.axis.to(device=self.device, dtype=dtype) for name, joint in joints.items()}
+        self._plans: Dict[Tuple[Tuple[str, ...], str], Optional[_ChainPlan]] = {}
 
     # ------------------------------------------------------------------
     # Introspection
@@ -245,7 +270,111 @@ class UrdfKinematics:
         expressed in the root frame and referenced at the link origin. Columns
         follow ``joint_names``; joints not on the chain to the link get zero
         columns.
+
+        Chains made of revolute and fixed joints (the arm) take the folded
+        batched path; anything with a prismatic joint takes the generic one.
+        Both return the same numbers.
         """
+        plan = self._chain_plan(tuple(joint_names), link_name)
+        if plan is None:
+            return self._pose_and_jacobian_generic(q, joint_names, link_name)
+        if q.ndim != 2 or q.shape[1] != len(joint_names):
+            raise ValueError("q must have shape (B, {}), got {}".format(len(joint_names), tuple(q.shape)))
+        q = q.to(device=self.device, dtype=self.dtype)
+        batch = q.shape[0]
+        count = plan.moving_count
+
+        angles = q[:, :count] if plan.columns_are_prefix else q[:, plan.columns]  # (B, K)
+        c = torch.cos(angles)[..., None, None]
+        s = torch.sin(angles)[..., None, None]
+        eye = torch.eye(3, dtype=self.dtype, device=self.device)
+        # Rodrigues for all K joints at once: R = cI + s[a]_x + (1 - c) a a^T.
+        joint_rotations = c * eye + s * plan.skew + (1.0 - c) * plan.outer  # (B, K, 3, 3)
+
+        rotation = plan.offset_rotation[0].expand(batch, 3, 3)
+        position = plan.offset_position[0].expand(batch, 3)
+        axes_world = []
+        origins_world = []
+        for index in range(count):
+            if index > 0:
+                # frame = pose @ offset: R' = R R_o, p' = R p_o + p.
+                position = position + (rotation @ plan.offset_position[index])
+                rotation = rotation @ plan.offset_rotation[index]
+            axes_world.append(rotation @ plan.axes[index])
+            origins_world.append(position)
+            rotation = rotation @ joint_rotations[:, index]
+        position = position + (rotation @ plan.offset_position[count])
+        rotation = rotation @ plan.offset_rotation[count]
+
+        pose = torch.zeros(batch, 4, 4, dtype=self.dtype, device=self.device)
+        pose[:, :3, :3] = rotation
+        pose[:, :3, 3] = position
+        pose[:, 3, 3] = 1.0
+
+        axis = torch.stack(axes_world, dim=1)  # (B, K, 3)
+        origin = torch.stack(origins_world, dim=1)  # (B, K, 3)
+        linear = torch.cross(axis, position.unsqueeze(1) - origin, dim=2)
+        block = torch.cat((linear, axis), dim=2).transpose(1, 2)  # (B, 6, K)
+        if plan.columns_are_prefix and count == len(joint_names):
+            return pose, block
+        jacobian = torch.zeros(batch, 6, len(joint_names), dtype=self.dtype, device=self.device)
+        jacobian[:, :, plan.columns] = block
+        return pose, jacobian
+
+    def _chain_plan(self, joint_names: Tuple[str, ...], link_name: str) -> Optional[_ChainPlan]:
+        key = (joint_names, link_name)
+        if key not in self._plans:
+            self._plans[key] = self._build_chain_plan(joint_names, link_name)
+        return self._plans[key]
+
+    def _build_chain_plan(self, joint_names: Tuple[str, ...], link_name: str) -> Optional[_ChainPlan]:
+        column_of = {name: index for index, name in enumerate(joint_names)}
+        chain = self.chain_to(link_name)
+        if any(self.joints[name].joint_type == "prismatic" and name in column_of for name in chain):
+            return None
+        # Fold in float64 and cast once: the constants are exact to the dtype.
+        pending = torch.eye(4, dtype=torch.float64)
+        offsets: List[torch.Tensor] = []
+        axes: List[torch.Tensor] = []
+        columns: List[int] = []
+        for joint_name in chain:
+            joint = self.joints[joint_name]
+            pending = pending @ joint.origin
+            if joint.joint_type == "fixed" or joint_name not in column_of:
+                continue  # constant (a fixed joint, or an actuated one held at zero)
+            offsets.append(pending)
+            axes.append(joint.axis)
+            columns.append(column_of[joint_name])
+            pending = torch.eye(4, dtype=torch.float64)
+        offsets.append(pending)
+        stacked = torch.stack(offsets)  # (K + 1, 4, 4)
+        axis = torch.stack(axes) if axes else torch.zeros(0, 3, dtype=torch.float64)
+        zero = torch.zeros_like(axis[:, 0])
+        skew = torch.stack(
+            (
+                torch.stack((zero, -axis[:, 2], axis[:, 1]), dim=1),
+                torch.stack((axis[:, 2], zero, -axis[:, 0]), dim=1),
+                torch.stack((-axis[:, 1], axis[:, 0], zero), dim=1),
+            ),
+            dim=1,
+        )
+        outer = axis.unsqueeze(2) * axis.unsqueeze(1)
+        to = lambda t: t.to(device=self.device, dtype=self.dtype)  # noqa: E731
+        column_tensor = torch.tensor(columns, dtype=torch.long, device=self.device)
+        return _ChainPlan(
+            offset_rotation=to(stacked[:, :3, :3]).contiguous(),
+            offset_position=to(stacked[:, :3, 3]).contiguous(),
+            axes=to(axis),
+            skew=to(skew),
+            outer=to(outer),
+            columns=column_tensor,
+            columns_are_prefix=columns == list(range(len(columns))),
+        )
+
+    def _pose_and_jacobian_generic(
+        self, q: torch.Tensor, joint_names: Sequence[str], link_name: str
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One 4x4 product per URDF joint; the reference the folded path is tested against."""
         values = self._joint_values(q, joint_names)
         batch = q.shape[0]
         eye = torch.eye(4, dtype=self.dtype, device=self.device).expand(batch, 4, 4)

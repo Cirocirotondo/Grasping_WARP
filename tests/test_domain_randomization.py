@@ -101,3 +101,32 @@ class DomainRandomizationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnappliedParametersTest(unittest.TestCase):
+    """Parameters the simulator cannot write must not reach the critic."""
+
+    def test_unapplied_parameters_leave_the_critic_row(self):
+        from simtoolreal_newton.envs.domain_randomization import UNAPPLIED_PARAMETERS
+
+        dr = DomainRandomization(
+            _Cfg(hand_stiffness_range=0.4, object_friction_range=0.4, critic_observes_parameters=True),
+            16,
+            unapplied=UNAPPLIED_PARAMETERS,
+        )
+        self.assertEqual(dr.privileged_dim, 9 - len(UNAPPLIED_PARAMETERS))
+        self.assertEqual(tuple(dr.privileged_table().shape), (16, 6))
+        self.assertEqual(dr.privileged_row(0).shape, (6,))
+        self.assertNotIn("object_friction", dr.critic_parameters)
+        self.assertIn("hand_stiffness", dr.critic_parameters)
+
+    def test_the_multipliers_are_still_drawn_so_the_rng_stream_is_unchanged(self):
+        plain = DomainRandomization(_Cfg(object_mass_range=0.25, object_friction_range=0.4), 64, seed=3)
+        marked = DomainRandomization(
+            _Cfg(object_mass_range=0.25, object_friction_range=0.4), 64, seed=3, unapplied=("object_friction",)
+        )
+        np.testing.assert_allclose(plain.samples["object_mass"], marked.samples["object_mass"])
+
+    def test_an_unknown_unapplied_name_is_refused(self):
+        with self.assertRaises(ValueError):
+            DomainRandomization(_Cfg(), 8, unapplied=("gravity",))

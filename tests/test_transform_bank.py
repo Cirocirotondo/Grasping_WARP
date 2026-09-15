@@ -198,15 +198,32 @@ class SampledBankTest(BankFixture):
             self.bank.keypoints_at(frames), self.bank.reference_keypoints[frames]
         )
 
-    def test_an_index_outside_the_bank_is_refused(self):
+    def test_an_index_outside_the_bank_is_refused_at_the_boundary(self):
         with self.assertRaises(IndexError):
-            self.bank.sample(
+            self.bank.validate_indices(
                 torch.tensor([self.bank.transform_count]), torch.tensor([0])
             )
         with self.assertRaises(IndexError):
-            self.bank.sample(
+            self.bank.validate_indices(
                 torch.tensor([0]), torch.tensor([self.bank.sample_count])
             )
+        self.bank.validate_indices(torch.tensor([0, 7]), torch.tensor([0, self.bank.last_index]))
+
+    def test_sampling_does_not_read_the_indices_back_to_the_host(self):
+        """The per-step path must not synchronise; only the boundary check may."""
+        calls = []
+        original = torch.any
+
+        def counting_any(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        torch.any = counting_any
+        try:
+            self.bank.sample(torch.tensor([0, 7]), torch.tensor([0, 5]))
+        finally:
+            torch.any = original
+        self.assertEqual(calls, [])
 
     def test_it_survives_a_save_and_load(self):
         import tempfile

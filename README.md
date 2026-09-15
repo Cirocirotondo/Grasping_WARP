@@ -5,7 +5,8 @@ UR5e + Tesollo DG5F demonstration-guided grasping, ported from Isaac Gym to
 The task, rewards, reference-state initialisation, transform bank and the
 AnimRL PPO runner are the ones from `simtoolreal_animrl`; only the simulator
 underneath changed. Training runs *kit-less*: no Isaac Sim / Omniverse is
-needed, the whole step (physics + task) is captured into one CUDA graph.
+needed, and the physics step is captured into one CUDA graph. The task side
+(control, rewards, observations, resets) runs as eager PyTorch on the GPU.
 
 ```
 env:     UR5e (6 DoF) + DG5F (20 DoF) articulation, cuboid, table   -> Isaac Lab DirectRLEnv

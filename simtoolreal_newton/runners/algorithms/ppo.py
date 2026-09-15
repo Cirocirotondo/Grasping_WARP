@@ -20,6 +20,39 @@ from simtoolreal_newton.runners.modules.value import Value
 from simtoolreal_newton.runners.storage.rollout_storage import RolloutStorage
 
 
+# Per-step statistics averaged over the rollout: (key in the rollout result,
+# key in the environment's step infos). Order is the order of the accumulator.
+_ROLLOUT_STEP_MEANS = (
+    ("mean_palm_tilt_reward", "palm_tilt_reward"),
+    ("mean_palm_tilt_error_rad", "palm_tilt_error_rad"),
+    ("mean_ee_action_rate_reward", "ee_action_rate_reward"),
+    ("mean_arm_joint_rate_reward", "arm_joint_rate_reward"),
+    ("mean_ik_residual_reward", "ik_residual_reward"),
+    ("mean_ik_residual_norm", "ik_residual_norm"),
+    ("mean_arm_joint_delta_clipped", "arm_joint_delta_clipped"),
+    ("mean_hand_position_reward", "hand_position_reward"),
+    ("mean_hand_velocity_reward", "hand_velocity_reward"),
+    ("mean_hand_action_rate_reward", "hand_action_rate_reward"),
+    ("mean_object_position_reward", "object_position_reward"),
+    ("mean_object_orientation_reward", "object_orientation_reward"),
+    ("mean_fingertip_object_distance_reward", "fingertip_object_distance_reward"),
+    ("mean_fingertip_object_distance_m", "fingertip_object_distance_m"),
+    ("mean_object_position_error_m", "object_position_error_m"),
+    ("mean_object_orientation_error_rad", "object_orientation_error_rad"),
+    ("mean_fingertip_contact_reward", "fingertip_contact_reward"),
+    ("mean_fingertip_contact_fraction", "fingertip_contact_fraction"),
+    ("mean_fingertip_contact_force_n", "mean_fingertip_contact_force_n"),
+    ("mean_object_assist_force_n", "object_assist_force_n"),
+    ("mean_object_assist_torque_nm", "object_assist_torque_nm"),
+    ("mean_rms_hand_position_error", "rms_hand_position_error"),
+    ("mean_rms_hand_action_rate", "rms_hand_action_rate"),
+    ("mean_rms_position_error", "rms_position_error"),
+    ("mean_rms_velocity_error", "rms_velocity_error"),
+    ("mean_rms_ee_action_rate", "rms_ee_action_rate"),
+    ("mean_rms_arm_joint_rate", "rms_arm_joint_rate"),
+)
+
+
 class PPO:
     """AnimRL PPO core with compatible networks and checkpoint schema."""
 
@@ -147,45 +180,20 @@ class PPO:
                 privileged_observations
             )
 
-        reward_sum = 0.0
-        done_count = 0
-        timeout_count = 0
-        early_termination_count = 0
-        episode_count = 0
+        # Every per-step statistic stays on the device and is read back once
+        # per rollout. A ``float(tensor)`` inside the loop is a GPU->CPU
+        # synchronisation, and there were about thirty of them per step.
+        device = self.device
+        step_mean_keys = [info_key for _, info_key in _ROLLOUT_STEP_MEANS]
+        step_means = torch.zeros(1 + len(step_mean_keys), device=device)  # [rewards, *infos]
+        max_abs_position_error = torch.zeros((), device=device)
+        max_abs_action = torch.zeros((), device=device)
+        # done, timeout, early termination, clipped action targets, |action| sum
+        counts = torch.zeros(5, device=device)
+        action_value_count = 0
+        episode_count = torch.zeros((), device=device)
         episode_sums = {}
         episode_maxima = {}
-        palm_tilt_reward_sum = 0.0
-        palm_tilt_error_sum = 0.0
-        ee_action_rate_reward_sum = 0.0
-        arm_joint_rate_reward_sum = 0.0
-        ik_residual_reward_sum = 0.0
-        ik_residual_norm_sum = 0.0
-        arm_joint_delta_clipped_sum = 0.0
-        hand_position_reward_sum = 0.0
-        hand_velocity_reward_sum = 0.0
-        hand_action_rate_reward_sum = 0.0
-        object_position_reward_sum = 0.0
-        object_orientation_reward_sum = 0.0
-        fingertip_object_distance_reward_sum = 0.0
-        fingertip_object_distance_sum = 0.0
-        object_position_error_sum = 0.0
-        object_orientation_error_sum = 0.0
-        fingertip_contact_reward_sum = 0.0
-        fingertip_contact_fraction_sum = 0.0
-        fingertip_contact_force_sum = 0.0
-        object_assist_force_sum = 0.0
-        object_assist_torque_sum = 0.0
-        rms_hand_position_error_sum = 0.0
-        rms_hand_action_rate_sum = 0.0
-        rms_position_error_sum = 0.0
-        rms_velocity_error_sum = 0.0
-        rms_ee_action_rate_sum = 0.0
-        rms_arm_joint_rate_sum = 0.0
-        max_abs_position_error = 0.0
-        clipped_action_target_count = 0
-        action_value_count = 0
-        abs_action_sum = 0.0
-        max_abs_action = 0.0
 
         with torch.inference_mode():
             for _ in range(int(self.cfg.num_steps_per_env)):
@@ -198,12 +206,11 @@ class PPO:
                 actions, log_prob = self.policy.act_and_log_prob(
                     actor_observations
                 )
-                clipped_action_target_count += int(
-                    self.env.saturated_actions(actions).sum()
-                )
+                abs_actions = actions.abs()
                 action_value_count += actions.numel()
-                abs_action_sum += float(actions.abs().sum())
-                max_abs_action = max(max_abs_action, float(actions.abs().max()))
+                counts[3] += self.env.saturated_actions(actions).sum()
+                counts[4] += abs_actions.sum()
+                max_abs_action = torch.maximum(max_abs_action, abs_actions.max())
                 (
                     next_observations,
                     next_privileged_observations,
@@ -231,108 +238,31 @@ class PPO:
                         privileged_observations
                     )
 
-                reward_sum += float(rewards.mean())
-                palm_tilt_reward_sum += float(infos["palm_tilt_reward"].mean())
-                palm_tilt_error_sum += float(
-                    infos["palm_tilt_error_rad"].mean()
+                step_means += torch.stack(
+                    [rewards.mean()] + [infos[key].mean() for key in step_mean_keys]
                 )
-                ee_action_rate_reward_sum += float(
-                    infos["ee_action_rate_reward"].mean()
-                )
-                arm_joint_rate_reward_sum += float(
-                    infos["arm_joint_rate_reward"].mean()
-                )
-                ik_residual_reward_sum += float(
-                    infos["ik_residual_reward"].mean()
-                )
-                ik_residual_norm_sum += float(infos["ik_residual_norm"].mean())
-                arm_joint_delta_clipped_sum += float(
-                    infos["arm_joint_delta_clipped"].mean()
-                )
-                rms_ee_action_rate_sum += float(
-                    infos["rms_ee_action_rate"].mean()
-                )
-                rms_arm_joint_rate_sum += float(
-                    infos["rms_arm_joint_rate"].mean()
-                )
-                hand_position_reward_sum += float(
-                    infos["hand_position_reward"].mean()
-                )
-                hand_velocity_reward_sum += float(
-                    infos["hand_velocity_reward"].mean()
-                )
-                hand_action_rate_reward_sum += float(
-                    infos["hand_action_rate_reward"].mean()
-                )
-                rms_hand_action_rate_sum += float(
-                    infos["rms_hand_action_rate"].mean()
-                )
-                object_position_reward_sum += float(
-                    infos["object_position_reward"].mean()
-                )
-                object_orientation_reward_sum += float(
-                    infos["object_orientation_reward"].mean()
-                )
-                fingertip_object_distance_reward_sum += float(
-                    infos["fingertip_object_distance_reward"].mean()
-                )
-                fingertip_object_distance_sum += float(
-                    infos["fingertip_object_distance_m"].mean()
-                )
-                object_position_error_sum += float(
-                    infos["object_position_error_m"].mean()
-                )
-                object_orientation_error_sum += float(
-                    infos["object_orientation_error_rad"].mean()
-                )
-                fingertip_contact_reward_sum += float(
-                    infos["fingertip_contact_reward"].mean()
-                )
-                fingertip_contact_fraction_sum += float(
-                    infos["fingertip_contact_fraction"].mean()
-                )
-                fingertip_contact_force_sum += float(
-                    infos["mean_fingertip_contact_force_n"].mean()
-                )
-                object_assist_force_sum += float(
-                    infos["object_assist_force_n"].mean()
-                )
-                object_assist_torque_sum += float(
-                    infos["object_assist_torque_nm"].mean()
-                )
-                rms_hand_position_error_sum += float(
-                    infos["rms_hand_position_error"].mean()
-                )
-                rms_position_error_sum += float(
-                    infos["rms_position_error"].mean()
-                )
-                rms_velocity_error_sum += float(
-                    infos["rms_velocity_error"].mean()
-                )
-                max_abs_position_error = max(
+                max_abs_position_error = torch.maximum(
                     max_abs_position_error,
-                    float(infos["max_abs_arm_position_error"].max()),
+                    infos["max_abs_arm_position_error"].max(),
                 )
-                done_count += int(dones.sum())
-                timeout_count += int(infos["time_outs"].sum())
-                early_termination_count += int(
-                    infos["early_termination"].sum()
-                )
+                counts[0] += dones.sum()
+                counts[1] += infos["time_outs"].sum()
+                counts[2] += infos["early_termination"].sum()
                 if "episode" in infos:
                     episode = infos["episode"]
-                    completed = int(episode["completed_episodes"])
-                    episode_count += completed
+                    completed = episode["completed_episodes"]
+                    episode_count = episode_count + completed
                     for name, value in episode.items():
                         if name == "completed_episodes":
                             continue
                         if name.startswith("max_"):
-                            episode_maxima[name] = max(
-                                episode_maxima.get(name, -math.inf),
-                                float(value),
+                            previous = episode_maxima.get(name)
+                            episode_maxima[name] = (
+                                value if previous is None else torch.maximum(previous, value)
                             )
                         else:
                             episode_sums[name] = episode_sums.get(name, 0.0) + (
-                                float(value) * completed
+                                value * completed
                             )
 
             # This deliberately follows AnimRL's existing rollout convention:
@@ -343,92 +273,45 @@ class PPO:
                 last_values, self.alg_cfg.gamma, self.alg_cfg.lam
             )
 
+        # The one read-back per rollout.
         rollout_steps = float(self.cfg.num_steps_per_env)
         transition_count = int(self.cfg.num_steps_per_env * self.env.num_envs)
-        result = {
-            "mean_reward": reward_sum / rollout_steps,
-            "mean_palm_tilt_reward": palm_tilt_reward_sum / rollout_steps,
-            "mean_palm_tilt_error_rad": palm_tilt_error_sum / rollout_steps,
-            "mean_ee_action_rate_reward": (
-                ee_action_rate_reward_sum / rollout_steps
-            ),
-            "mean_arm_joint_rate_reward": (
-                arm_joint_rate_reward_sum / rollout_steps
-            ),
-            "mean_ik_residual_reward": ik_residual_reward_sum / rollout_steps,
-            "mean_ik_residual_norm": ik_residual_norm_sum / rollout_steps,
-            "mean_arm_joint_delta_clipped": (
-                arm_joint_delta_clipped_sum / rollout_steps
-            ),
-            "mean_hand_position_reward": hand_position_reward_sum / rollout_steps,
-            "mean_hand_velocity_reward": hand_velocity_reward_sum / rollout_steps,
-            "mean_hand_action_rate_reward": (
-                hand_action_rate_reward_sum / rollout_steps
-            ),
-            "mean_object_position_reward": (
-                object_position_reward_sum / rollout_steps
-            ),
-            "mean_object_orientation_reward": (
-                object_orientation_reward_sum / rollout_steps
-            ),
-            "mean_fingertip_object_distance_reward": (
-                fingertip_object_distance_reward_sum / rollout_steps
-            ),
-            "mean_fingertip_object_distance_m": (
-                fingertip_object_distance_sum / rollout_steps
-            ),
-            "mean_object_position_error_m": (
-                object_position_error_sum / rollout_steps
-            ),
-            "mean_object_orientation_error_rad": (
-                object_orientation_error_sum / rollout_steps
-            ),
-            "mean_fingertip_contact_reward": (
-                fingertip_contact_reward_sum / rollout_steps
-            ),
-            "mean_fingertip_contact_fraction": (
-                fingertip_contact_fraction_sum / rollout_steps
-            ),
-            "mean_fingertip_contact_force_n": (
-                fingertip_contact_force_sum / rollout_steps
-            ),
-            "mean_object_assist_force_n": (
-                object_assist_force_sum / rollout_steps
-            ),
-            "mean_object_assist_torque_nm": (
-                object_assist_torque_sum / rollout_steps
-            ),
-            "mean_rms_hand_position_error": (
-                rms_hand_position_error_sum / rollout_steps
-            ),
-            "mean_rms_hand_action_rate": (
-                rms_hand_action_rate_sum / rollout_steps
-            ),
-            "mean_rms_position_error": rms_position_error_sum / rollout_steps,
-            "mean_rms_velocity_error": rms_velocity_error_sum / rollout_steps,
-            "mean_rms_ee_action_rate": rms_ee_action_rate_sum / rollout_steps,
-            "mean_rms_arm_joint_rate": rms_arm_joint_rate_sum / rollout_steps,
-            "max_abs_position_error": max_abs_position_error,
-            "action_target_clipped_fraction": (
-                clipped_action_target_count / float(max(action_value_count, 1))
-            ),
-            "mean_abs_action": abs_action_sum / float(max(action_value_count, 1)),
-            "max_abs_action": max_abs_action,
-            "done_count": done_count,
-            "timeout_count": timeout_count,
-            "early_termination_count": early_termination_count,
-            "done_fraction": done_count / float(transition_count),
-            "timeout_fraction": timeout_count / float(transition_count),
-            "early_termination_fraction": (
-                early_termination_count / float(transition_count)
-            ),
-            "episode_count": episode_count,
-        }
+        means = [total / rollout_steps for total in step_means.tolist()]
+        done_count, timeout_count, early_termination_count, clipped_action_target_count, abs_action_sum = (
+            counts.tolist()
+        )
+        done_count = int(done_count)
+        timeout_count = int(timeout_count)
+        early_termination_count = int(early_termination_count)
+        clipped_action_target_count = int(clipped_action_target_count)
+        episode_count = int(episode_count)
+        result = {"mean_reward": means[0]}
+        for (result_key, _), mean in zip(_ROLLOUT_STEP_MEANS, means[1:]):
+            result[result_key] = mean
+        result.update(
+            {
+                "max_abs_position_error": float(max_abs_position_error),
+                "action_target_clipped_fraction": (
+                    clipped_action_target_count / float(max(action_value_count, 1))
+                ),
+                "mean_abs_action": abs_action_sum / float(max(action_value_count, 1)),
+                "max_abs_action": float(max_abs_action),
+                "done_count": done_count,
+                "timeout_count": timeout_count,
+                "early_termination_count": early_termination_count,
+                "done_fraction": done_count / float(transition_count),
+                "timeout_fraction": timeout_count / float(transition_count),
+                "early_termination_fraction": (
+                    early_termination_count / float(transition_count)
+                ),
+                "episode_count": episode_count,
+            }
+        )
         if episode_count > 0:
             for name, total in episode_sums.items():
-                result["episode_{}".format(name)] = total / episode_count
+                result["episode_{}".format(name)] = float(total) / episode_count
             for name, maximum in episode_maxima.items():
-                result["episode_{}".format(name)] = maximum
+                result["episode_{}".format(name)] = float(maximum)
         return result
 
     def process_env_step(

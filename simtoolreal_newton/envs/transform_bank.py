@@ -146,10 +146,17 @@ class TransformBank:
             self.acceptance,
         )
 
-    def sample(
+    def validate_indices(
         self, transform_indices: torch.Tensor, frame_indices: torch.Tensor
-    ) -> BankSample:
-        """Gather one ``(transform, frame)`` pair per environment."""
+    ) -> None:
+        """Refuse indices outside the bank.
+
+        Each comparison here is a GPU->CPU synchronisation, so this is for
+        the boundary where indices enter (a reset with caller-supplied
+        indices, a tool), not for :meth:`sample` on the per-step path, whose
+        indices are in range by construction (clamped counters and argmin
+        results).
+        """
         transform_indices = transform_indices.long()
         frame_indices = frame_indices.long()
         if transform_indices.shape != frame_indices.shape:
@@ -160,6 +167,20 @@ class TransformBank:
             raise IndexError("Transform index outside the bank")
         if torch.any(frame_indices < 0) or torch.any(frame_indices > self.last_index):
             raise IndexError("Reference index outside the demonstration")
+
+    def sample(
+        self, transform_indices: torch.Tensor, frame_indices: torch.Tensor
+    ) -> BankSample:
+        """Gather one ``(transform, frame)`` pair per environment.
+
+        No bounds checks: this runs several times per step and a host-side
+        check would stall the CUDA stream each time. See
+        :meth:`validate_indices`.
+        """
+        transform_indices = transform_indices.long()
+        frame_indices = frame_indices.long()
+        if transform_indices.shape != frame_indices.shape:
+            raise ValueError("Transform and frame indices must have one shape")
         return BankSample(
             self.q[transform_indices, frame_indices],
             self.dq[transform_indices, frame_indices],
