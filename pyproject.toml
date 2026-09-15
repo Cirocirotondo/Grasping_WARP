@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simtoolreal-newton"
+version = "0.1.0"
+description = "UR5e + DG5F demonstration-guided grasping on Isaac Lab 3.0 with the Newton (MuJoCo-Warp) backend"
+requires-python = ">=3.12"
+# Isaac Lab and its physics backends are installed from the pinned checkout in
+# deps/IsaacLab by setup.sh; only the extras this package adds are listed here.
+dependencies = [
+    "numpy",
+    "torch",
+    "tensorboard",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+retarget = ["pytorch_kinematics>=0.7"]
+sim2sim = ["mujoco>=3.2"]
+video = ["imageio", "imageio-ffmpeg"]
+
+# Makes the task discoverable by `isaaclab train --task SimToolReal-Grasp-Direct`.
+[project.entry-points."isaaclab.tasks"]
+simtoolreal_newton = "simtoolreal_newton.tasks"
+
+[tool.setuptools.packages.find]
+include = ["simtoolreal_newton", "simtoolreal_newton.*"]

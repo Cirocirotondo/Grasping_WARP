@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""Train the UR5e + DG5F motion-imitation policy with AnimRL PPO on Isaac Lab / Newton."""
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from simtoolreal_newton.cfg import (
+    SimToolRealCfg,
+    SimToolRealTrainCfg,
+    config_to_dict,
+)
+from simtoolreal_newton.envs.contact import fingertip_force_observation_dim
+from simtoolreal_newton.launch import add_env_arguments, make_env
+from simtoolreal_newton.runners.lineage import resolve_lineage
+from simtoolreal_newton.runners import (
+    PPO,
+    SubprocessDeterministicEvaluator,
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=None,
+        help="Override the AnimRL production value of 4096 environments.",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="PPO updates to run in this invocation (default: config value).",
+    )
+    add_env_arguments(parser)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--run-name", default=None)
+    parser.add_argument(
+        "--log-root",
+        type=Path,
+        default=REPO_ROOT / "logs",
+        help="Root used for newly created runs.",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="Use an exact run directory instead of generating one.",
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Resume optimizer, networks, normalizers, and counters.",
+    )
+    parser.add_argument(
+        "--start-iteration",
+        type=int,
+        default=None,
+        help="Required only for legacy checkpoints without iteration metadata.",
+    )
+    parser.add_argument("--save-interval", type=int, default=None)
+    parser.add_argument("--eval-interval", type=int, default=None)
+    parser.add_argument("--eval-num-envs", type=int, default=None)
+    parser.add_argument("--eval-seed", type=int, default=None)
+    parser.add_argument(
+        "--no-periodic-eval",
+        action="store_true",
+        help="Disable the deterministic fixed/configured-RSI evaluation.",
+    )
+    video_group = parser.add_mutually_exclusive_group()
+    video_group.add_argument(
+        "--record-video",
+        dest="record_video",
+        action="store_true",
+        default=None,
+        help=(
+            "Record the configured training environment every 500 PPO "
+            "iterations with the kit-less Warp camera (needs imageio-ffmpeg)."
+        ),
+    )
+    video_group.add_argument(
+        "--no-record-video",
+        dest="record_video",
+        action="store_false",
+        help="Force the compute-only headless path with no graphics context.",
+    )
+    assist_group = parser.add_mutually_exclusive_group()
+    assist_group.add_argument(
+        "--object-assist",
+        dest="object_assist",
+        action="store_true",
+        default=None,
+        help=(
+            "Help the object toward its demonstrated pose with an external PD "
+            "wrench plus gravity compensation, annealed to zero over the "
+            "object_assist iteration window."
+        ),
+    )
+    assist_group.add_argument(
+        "--no-object-assist",
+        dest="object_assist",
+        action="store_false",
+        help="Train on the unassisted object (the configuration default).",
+    )
+    parser.add_argument(
+        "--object-assist-start-iteration",
+        type=int,
+        default=None,
+        help="Iteration at which the assist starts decaying (default: config).",
+    )
+    parser.add_argument(
+        "--object-assist-end-iteration",
+        type=int,
+        default=None,
+        help="Iteration at which the assist reaches zero (default: config).",
+    )
+    contact_obs_group = parser.add_mutually_exclusive_group()
+    contact_obs_group.add_argument(
+        "--contact-observations",
+        dest="contact_observations",
+        action="store_true",
+        default=None,
+        help=(
+            "Feed the policy one contact-force vector per selected fingertip, "
+            "in the palm frame. Turns on contact reporting as well, and widens "
+            "the observation vector, so a checkpoint from a run without it "
+            "cannot be resumed into a run with it."
+        ),
+    )
+    contact_obs_group.add_argument(
+        "--no-contact-observations",
+        dest="contact_observations",
+        action="store_false",
+        help="Train on the blind observation vector (the configuration default).",
+    )
+    parser.add_argument(
+        "--domain-randomization",
+        action="store_true",
+        help=(
+            "Vary PD gains, friction and object mass per environment. Added "
+            "after the roughest policy trained here transferred to MuJoCo "
+            "better than the smoothest ones: fine distinctions tuned to one "
+            "contact model do not survive a change of simulator."
+        ),
+    )
+    parser.add_argument(
+        "--asymmetric-critic",
+        action="store_true",
+        help=(
+            "Asymmetric actor-critic: the actor keeps its observation vector "
+            "while the critic additionally reads the fingertip contact forces. "
+            "The critic is discarded at deployment, so this costs the deployed "
+            "policy nothing. Turns on contact reporting as well."
+        ),
+    )
+    parser.add_argument("--log-interval", type=int, default=1)
+    parser.add_argument(
+        "--no-final-eval",
+        dest="final_eval",
+        action="store_false",
+        help=(
+            "Skip the headless evaluation with diagnostic plots that runs "
+            "once training finishes."
+        ),
+    )
+    parser.add_argument(
+        "--final-eval-rsi-index",
+        type=int,
+        default=0,
+        help=(
+            "Reference sample the final evaluation starts from (default: 0, "
+            "the whole demonstration)."
+        ),
+    )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="PATH=VALUE",
+        help=(
+            "Override one configuration field, e.g. "
+            "--set rewards.velocity_std_rad_per_s=0.3. Repeatable. Prefix the "
+            "path with 'train.' to address the training config instead of the "
+            "environment config. Unknown fields are rejected."
+        ),
+    )
+    args = parser.parse_args()
+    if args.sim_device is None:
+        args.sim_device = "cuda:0"
+    return args
+
+
+def resolve_run_directory(args, train_cfg):
+    if args.log_dir is not None:
+        return args.log_dir.expanduser().resolve()
+    if args.resume is not None:
+        return args.resume.expanduser().resolve().parent
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    return (
+        args.log_root.expanduser().resolve()
+        / train_cfg.runner.experiment_name
+        / "{}_{}".format(timestamp, train_cfg.runner.run_name)
+    )
+
+
+def resolve_start_iteration(args, checkpoint_infos):
+    if args.start_iteration is not None:
+        if args.start_iteration < 0:
+            raise ValueError("--start-iteration cannot be negative")
+        return args.start_iteration
+    if args.resume is None:
+        return 0
+    if isinstance(checkpoint_infos, dict) and "next_iteration" in checkpoint_infos:
+        return int(checkpoint_infos["next_iteration"])
+    raise ValueError(
+        "The resume checkpoint has no iteration metadata; pass "
+        "--start-iteration explicitly."
+    )
+
+
+def apply_overrides(env_cfg, train_cfg, overrides):
+    """Apply --set PATH=VALUE onto the configs, rejecting unknown fields.
+
+    A typo in a sweep must fail loudly rather than silently training the
+    default value, so every path component is checked against the config.
+    """
+    applied = {}
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError("--set expects PATH=VALUE, got {!r}".format(item))
+        path, raw = item.split("=", 1)
+        path = path.strip()
+        if path.startswith("train."):
+            node, remainder = train_cfg, path[len("train."):]
+        else:
+            node, remainder = env_cfg, path
+        parts = [part for part in remainder.split(".") if part]
+        if not parts:
+            raise ValueError("--set has an empty path in {!r}".format(item))
+        for part in parts[:-1]:
+            if not hasattr(node, part):
+                raise KeyError(
+                    "Unknown configuration section {!r} in --set {}".format(
+                        part, item
+                    )
+                )
+            node = getattr(node, part)
+        leaf = parts[-1]
+        if not hasattr(node, leaf):
+            raise KeyError(
+                "Unknown configuration field {!r} in --set {}".format(leaf, item)
+            )
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        setattr(node, leaf, value)
+        applied[path] = value
+    return applied
+
+
+def resolve_final_checkpoint(run_dir):
+    """Prefer the evaluation-selected checkpoint, else the newest one saved."""
+    best = run_dir / "best_model.pt"
+    if best.is_file():
+        return best
+    saved = []
+    for path in run_dir.glob("model_*.pt"):
+        try:
+            saved.append((int(path.stem.split("_")[1]), path))
+        except (IndexError, ValueError):
+            continue
+    return max(saved)[1] if saved else None
+
+
+def run_final_evaluation(run_dir, args, record_video=False):
+    """Evaluate the finished policy in a fresh process and write its plots.
+
+    A separate process is required because Isaac Lab allows one simulation
+    context per process, and it runs only after the training simulation has
+    been released.
+    """
+    checkpoint = resolve_final_checkpoint(run_dir)
+    if checkpoint is None:
+        print("Final evaluation skipped: the run saved no checkpoint")
+        return
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "evaluate.py"),
+        "--checkpoint",
+        str(checkpoint),
+        "--config",
+        str(run_dir / "config.json"),
+        "--rsi-index",
+        str(args.final_eval_rsi_index),
+        "--sim-device",
+        args.sim_device,
+        "--num-envs",
+        "1",
+        "--print-every",
+        "0",
+    ]
+    if args.physics is not None:
+        command += ["--physics", str(args.physics)]
+    print("\nFinal evaluation of {} (headless, with plots)".format(checkpoint.name))
+    completed = subprocess.run(command)
+    if completed.returncode != 0:
+        # Training already succeeded and its checkpoints are on disk, so a
+        # failed evaluation is reported rather than raised.
+        print(
+            "Final evaluation failed with exit code {}; the run itself is "
+            "unaffected.".format(completed.returncode)
+        )
+
+
+def save_configuration(run_dir, env_cfg, train_cfg, args, lineage=None):
+    config_path = run_dir / "config.json"
+    if config_path.exists():
+        return
+    snapshot = {
+        "env_cfg": config_to_dict(env_cfg),
+        "train_cfg": config_to_dict(train_cfg),
+        "runtime": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        # env.num_observations is the base width; optional blocks widen what the
+        # policy is actually built with, so the total is recorded separately
+        # rather than left to be re-derived from the flags.
+        "observation_dim": (
+            int(env_cfg.env.num_observations)
+            + fingertip_force_observation_dim(env_cfg.contact)
+        ),
+        # Where the starting weights came from. runtime.resume alone is not
+        # enough: a warm start resumes from a copy inside this very run, so
+        # without this the parent run is unrecoverable.
+        "lineage": lineage,
+    }
+    with config_path.open("w", encoding="utf-8") as config_file:
+        json.dump(snapshot, config_file, indent=2, sort_keys=True)
+
+
+def main():
+    args = parse_args()
+    env_cfg = SimToolRealCfg()
+    train_cfg = SimToolRealTrainCfg()
+    if args.seed is not None:
+        env_cfg.seed = int(args.seed)
+    if args.num_envs is not None:
+        if args.num_envs <= 0:
+            raise ValueError("--num-envs must be positive")
+        env_cfg.env.num_envs = int(args.num_envs)
+    if args.run_name is not None:
+        train_cfg.runner.run_name = args.run_name
+    if args.no_periodic_eval:
+        train_cfg.runner.evaluation_enabled = False
+    if args.record_video is not None:
+        train_cfg.runner.record_video = bool(args.record_video)
+    if args.eval_interval is not None:
+        if args.eval_interval <= 0:
+            raise ValueError("--eval-interval must be positive")
+        train_cfg.runner.evaluation_interval = int(args.eval_interval)
+    if args.eval_num_envs is not None:
+        if args.eval_num_envs <= 0:
+            raise ValueError("--eval-num-envs must be positive")
+        train_cfg.runner.evaluation_num_envs = int(args.eval_num_envs)
+    if args.eval_seed is not None:
+        train_cfg.runner.evaluation_seed = int(args.eval_seed)
+    if args.object_assist is not None:
+        env_cfg.object_assist.enabled = bool(args.object_assist)
+    if args.object_assist_start_iteration is not None:
+        env_cfg.object_assist.start_iteration = int(
+            args.object_assist_start_iteration
+        )
+    if args.object_assist_end_iteration is not None:
+        env_cfg.object_assist.end_iteration = int(
+            args.object_assist_end_iteration
+        )
+    if args.contact_observations is not None:
+        env_cfg.contact.observe_fingertip_forces = bool(args.contact_observations)
+        # The observation reads the PhysX force tensor, which only exists when
+        # contact reporting is on, so the flag carries its prerequisite with it.
+        if args.contact_observations:
+            env_cfg.contact.enabled = True
+    if args.domain_randomization:
+        env_cfg.domain_randomization.enabled = True
+        # Gains first: the transfer failure was a drive-dynamics failure, and
+        # the hand is where it lives. Friction and mass follow because a blind
+        # policy cannot sense either and must be robust to both open loop.
+        env_cfg.domain_randomization.hand_stiffness_range = 0.40
+        env_cfg.domain_randomization.hand_damping_range = 0.40
+        env_cfg.domain_randomization.arm_stiffness_range = 0.20
+        env_cfg.domain_randomization.arm_damping_range = 0.20
+        env_cfg.domain_randomization.fingertip_friction_range = 0.35
+        env_cfg.domain_randomization.object_friction_range = 0.35
+        env_cfg.domain_randomization.object_mass_range = 0.25
+        env_cfg.domain_randomization.table_friction_range = 0.35
+        env_cfg.domain_randomization.robot_link_mass_range = 0.15
+        # Roughly one push per environment per second at 60 Hz. The robot takes
+        # a real knock; the cube gets a nudge that needs correcting, not one
+        # that throws it out of the hand (0.2 kg, 1 N for one step ~ 0.08 m/s).
+        env_cfg.domain_randomization.robot_impulse_probability = 0.02
+        env_cfg.domain_randomization.robot_impulse_n = 12.0
+        env_cfg.domain_randomization.object_impulse_probability = 0.02
+        env_cfg.domain_randomization.object_impulse_n = 1.0
+        # Sensor realism, taken from the rot6d_dr config that produced a notably
+        # smooth policy elsewhere. Velocity noise is deliberately ~85x the
+        # position noise: hardware differentiates a quantised encoder, and that
+        # is where real noise lives.
+        env_cfg.domain_randomization.obs_q_noise_rad = 0.005
+        env_cfg.domain_randomization.obs_q_bias_rad = 0.005
+        env_cfg.domain_randomization.obs_dq_noise_rad_s = 0.4243
+        env_cfg.domain_randomization.action_delay_max_steps = 1
+    if args.asymmetric_critic:
+        env_cfg.contact.critic_observes_fingertip_forces = True
+        env_cfg.contact.enabled = True
+        # A scratch run can also hand the critic the randomisation multipliers,
+        # which a warm start cannot: it widens the critic input past any saved
+        # value network. Only meaningful when randomisation is on.
+        if args.domain_randomization and args.resume is None:
+            env_cfg.domain_randomization.critic_observes_parameters = True
+    # Applied last so an explicit --set always wins over the flags above.
+    applied_overrides = apply_overrides(env_cfg, train_cfg, args.overrides)
+    for path, value in applied_overrides.items():
+        print("Override: {} = {!r}".format(path, value))
+    # Camera construction is an environment concern, while cadence and video
+    # encoding belong to the runner. Mirror the final (possibly overridden)
+    # runner switch before saving config.json and constructing the simulation.
+    env_cfg.viewer.training_camera_enabled = bool(
+        train_cfg.runner.record_video
+    )
+
+    num_iterations = (
+        int(args.iterations)
+        if args.iterations is not None
+        else int(train_cfg.runner.max_iterations)
+    )
+    save_interval = (
+        int(args.save_interval)
+        if args.save_interval is not None
+        else int(train_cfg.runner.save_interval)
+    )
+    if num_iterations <= 0:
+        raise ValueError("--iterations must be positive")
+
+    run_dir = resolve_run_directory(args, train_cfg)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    lineage = resolve_lineage(args.resume)
+    if lineage is not None:
+        print("Starting from: {} ({})".format(
+            lineage.get("parent_run", "unknown"),
+            "copied checkpoint" if lineage.get("copied") else "direct resume",
+        ))
+    save_configuration(run_dir, env_cfg, train_cfg, args, lineage)
+    print("Run directory: {}".format(run_dir))
+
+    env = make_env(
+        env_cfg,
+        num_envs=None,
+        device=args.sim_device,
+        physics=args.physics,
+        visualizer=args.viz,
+    )
+    runner = None
+    training_completed = False
+    try:
+        runner = PPO(env, train_cfg, log_dir=run_dir, device=env.device)
+        checkpoint_infos = None
+        if args.resume is not None:
+            resume_path = args.resume.expanduser().resolve()
+            print("Loading checkpoint: {}".format(resume_path))
+            checkpoint_infos = runner.load(
+                resume_path,
+                load_optimizer=True,
+                load_normalizers=True,
+            )
+        start_iteration = resolve_start_iteration(args, checkpoint_infos)
+        print(
+            "Training {} environments for {} PPO updates, starting at {}".format(
+                env.num_envs, num_iterations, start_iteration
+            )
+        )
+        if env.object_assist_enabled:
+            assist = env.object_assist_settings
+            print(
+                "Object assist: {} schedule, scale {} -> {} between "
+                "iterations {} and {}; evaluation always runs unassisted".format(
+                    assist.schedule,
+                    assist.initial_scale,
+                    assist.final_scale,
+                    assist.start_iteration,
+                    assist.end_iteration,
+                )
+            )
+        evaluator = None
+        if bool(train_cfg.runner.evaluation_enabled):
+            evaluator = SubprocessDeterministicEvaluator(
+                interval=train_cfg.runner.evaluation_interval,
+                num_envs=train_cfg.runner.evaluation_num_envs,
+                seed=train_cfg.runner.evaluation_seed,
+                fixed_phases=train_cfg.runner.evaluation_fixed_phases,
+                sim_device=args.sim_device,
+                config_path=run_dir / "config.json",
+                run_dir=run_dir,
+            )
+            if args.physics is not None:
+                evaluator.extra_arguments = ["--physics", str(args.physics)]
+            print(
+                "Periodic deterministic evaluation: {} envs every {} "
+                "iterations, plus the final update".format(
+                    train_cfg.runner.evaluation_num_envs,
+                    train_cfg.runner.evaluation_interval,
+                )
+            )
+        history = runner.learn(
+            num_iterations=num_iterations,
+            start_iteration=start_iteration,
+            checkpoint_dir=run_dir,
+            save_interval=save_interval,
+            log_interval=args.log_interval,
+            metrics_path=run_dir / "metrics.jsonl",
+            evaluation_callback=evaluator,
+        )
+        # A run stopped by the divergence guard has no policy worth replaying,
+        # and its last checkpoint is diverged_model.pt rather than a final one.
+        diverged = bool(history and history[-1].get("divergence_abort"))
+        training_completed = not diverged
+    finally:
+        if runner is not None:
+            runner.close()
+        env.close()
+
+    # Outside the try block: the training simulation has to be closed before a
+    # second one can start, and an interrupted run should not be evaluated.
+    if training_completed and args.final_eval:
+        run_final_evaluation(
+            run_dir, args, record_video=bool(train_cfg.runner.record_video)
+        )
+
+
+if __name__ == "__main__":
+    main()

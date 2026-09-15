@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""Evaluate an AnimRL checkpoint with deterministic mean actions."""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from simtoolreal_newton.cfg import (
+    SimToolRealCfg,
+    SimToolRealTrainCfg,
+    update_config_from_dict,
+)
+from simtoolreal_newton.launch import add_env_arguments, make_env
+from simtoolreal_newton.runners import PPO
+from simtoolreal_newton.runners.eval_plotter import EvaluationPlotter
+
+import torch
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Defaults to config.json next to the checkpoint.",
+    )
+    parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument("--episodes", type=int, default=1)
+    add_env_arguments(parser)
+    parser.add_argument("--seed", type=int, default=1)
+    rsi = parser.add_mutually_exclusive_group()
+    rsi.add_argument(
+        "--rsi-index",
+        type=int,
+        default=0,
+        help=(
+            "Reference sample the episode starts from (default: 0). "
+            "Playback always continues to the final sample."
+        ),
+    )
+    rsi.add_argument(
+        "--sampled-rsi",
+        "--uniform-rsi",
+        dest="sampled_rsi",
+        action="store_true",
+        help=(
+            "Use the same seeded configured RSI distribution as training. "
+            "--uniform-rsi is retained as a compatibility alias."
+        ),
+    )
+    parser.add_argument(
+        "--no-ghost",
+        dest="ghost",
+        action="store_false",
+        help=(
+            "Hide the green reference robot shown beside the policy robot. "
+            "It is built for --viewer and for --record-video."
+        ),
+    )
+    parser.add_argument(
+        "--record-video",
+        action="store_true",
+        help=(
+            "Record the evaluation to an MP4 from the kit-less Warp camera "
+            "(needs imageio-ffmpeg). The reference ghost is not drawn."
+        ),
+    )
+    parser.add_argument(
+        "--video-path",
+        type=Path,
+        default=None,
+        help="MP4 to write (default: eval_videos/ next to the checkpoint).",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=int,
+        default=60,
+        help="Frames per second; 60 matches the demonstration in real time.",
+    )
+    parser.add_argument(
+        "--video-size",
+        type=int,
+        nargs=2,
+        default=[960, 720],
+        metavar=("WIDTH", "HEIGHT"),
+        help="Recorded frame size.",
+    )
+    parser.add_argument(
+        "--print-every",
+        type=int,
+        default=30,
+        help="Print rollout diagnostics every N steps; 0 disables them.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="JSON output path (default: next to the checkpoint).",
+    )
+    parser.add_argument(
+        "--no-plots",
+        dest="plots",
+        action="store_false",
+        help="Skip the per-episode diagnostic figures.",
+    )
+    parser.add_argument(
+        "--contact-forces",
+        action="store_true",
+        help=(
+            "Force PhysX contact reporting on for this evaluation so the "
+            "per-fingertip force figure is produced even when the run was "
+            "trained with contact.enabled=false. The contact reward is "
+            "zeroed, so the measured return is unaffected."
+        ),
+    )
+    parser.add_argument(
+        "--object-assist-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Object-assist scale for this evaluation. The default of 0 "
+            "replays the policy on the unassisted task; pass the training "
+            "scale to see what the helper wrench was doing for it."
+        ),
+    )
+    parser.add_argument(
+        "--plot-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for the diagnostic figures "
+            "(default: eval_plots/ next to the checkpoint)."
+        ),
+    )
+    return parser.parse_args()
+
+
+def load_saved_configuration(config_path):
+    env_cfg = SimToolRealCfg()
+    train_cfg = SimToolRealTrainCfg()
+    if config_path is None:
+        return env_cfg, train_cfg
+    with config_path.open("r", encoding="utf-8") as config_file:
+        saved = json.load(config_file)
+    if "env_cfg" not in saved or "train_cfg" not in saved:
+        raise ValueError(
+            "Configuration must contain env_cfg and train_cfg sections"
+        )
+    update_config_from_dict(env_cfg, saved["env_cfg"], strict=False)
+    update_config_from_dict(train_cfg, saved["train_cfg"], strict=False)
+    return env_cfg, train_cfg
+
+
+def scalar(value):
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().cpu())
+    return float(value)
+
+
+class EvaluationVideo:
+    """Write one MP4 of the evaluation from the environment's own camera.
+
+    The camera is the same off-screen sensor training uses, so the recording
+    needs no viewer; with the reference ghost enabled the green demonstration
+    robot stands beside the policy robot exactly as it does on screen.
+    """
+
+    def __init__(self, path, fps):
+        import imageio.v2 as imageio
+        import imageio_ffmpeg
+
+        imageio_ffmpeg.get_ffmpeg_exe()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.fps = int(fps)
+        self.frames = 0
+        self._writer = imageio.get_writer(
+            str(path),
+            format="FFMPEG",
+            mode="I",
+            fps=self.fps,
+            codec="libx264",
+            quality=8,
+            macro_block_size=None,
+        )
+
+    def capture(self, env):
+        self._writer.append_data(env.capture_training_camera_frame())
+        self.frames += 1
+
+    def close(self):
+        if self._writer is None:
+            return
+        writer, self._writer = self._writer, None
+        writer.close()
+
+    @property
+    def duration_s(self):
+        return self.frames / float(self.fps)
+
+
+def termination_reason(infos, env_idx=0):
+    """Name why env `env_idx` stopped, for the diagnostic figure titles."""
+    if bool(infos["early_termination"][env_idx]):
+        return "early_termination"
+    if bool(infos["reference_end"][env_idx]):
+        return "reference_end"
+    if bool(infos["horizon_time_outs"][env_idx]):
+        return "horizon"
+    return "done"
+
+
+def main():
+    args = parse_args()
+    checkpoint = args.checkpoint.expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError("Checkpoint not found: {}".format(checkpoint))
+    config_path = (
+        args.config.expanduser().resolve()
+        if args.config is not None
+        else checkpoint.parent / "config.json"
+    )
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            "Training configuration not found: {}. Pass --config explicitly."
+            .format(config_path)
+        )
+    if args.num_envs <= 0:
+        raise ValueError("--num-envs must be positive")
+    if args.episodes <= 0:
+        raise ValueError("--episodes must be positive")
+    if args.print_every < 0:
+        raise ValueError("--print-every cannot be negative")
+
+    env_cfg, train_cfg = load_saved_configuration(config_path)
+    env_cfg.seed = int(args.seed)
+    env_cfg.env.num_envs = int(args.num_envs)
+    env_cfg.env.play = True
+    args.viewer = args.viz is not None
+    env_cfg.viewer.enable_viewer = bool(args.viewer)
+    env_cfg.viewer.camera_position = [-1.0, -1.0, 1.5]
+    env_cfg.viewer.camera_lookat = [0.0, 0.6, 0.75]
+    env_cfg.viewer.reference_ghost = bool(
+        args.ghost and (args.viewer or args.record_video)
+    )
+    if args.record_video:
+        env_cfg.viewer.training_camera_enabled = True
+        env_cfg.viewer.training_camera_env_index = 0
+        env_cfg.viewer.training_camera_width = int(args.video_size[0])
+        env_cfg.viewer.training_camera_height = int(args.video_size[1])
+        env_cfg.viewer.training_camera_fov_deg = 62.0
+        if env_cfg.viewer.reference_ghost:
+            # Frame both robots: the ghost stands one offset to the side, so
+            # the camera aims at the midpoint and steps back far enough for
+            # the pair to fit at this field of view.
+            offset = [float(v) for v in env_cfg.viewer.reference_ghost_offset]
+            middle = offset[0] / 2.0
+            env_cfg.viewer.camera_lookat = [middle, 0.62, 0.72]
+            env_cfg.viewer.camera_position = [middle - 1.75, -1.45, 1.70]
+        else:
+            env_cfg.viewer.camera_lookat = [0.0, 0.62, 0.72]
+            env_cfg.viewer.camera_position = [-1.30, -1.05, 1.55]
+    # Playback always runs from the chosen RSI index to the final reference
+    # sample, so the tracking threshold must not cut the episode short. The
+    # threshold is still reported: see max_abs_position_error below.
+    env_cfg.termination.enabled = False
+    if args.contact_forces:
+        # Acquiring the contact tensor is a construction-time decision, but the
+        # reward must not change: with reward_per_finger at zero the contact
+        # term contributes nothing and the return stays comparable to training.
+        env_cfg.contact.enabled = True
+        env_cfg.contact.reward_per_finger = 0.0
+    # The training schedule is iteration-driven and this process runs no
+    # iterations, so the assist is pinned explicitly instead of inherited.
+    if float(args.object_assist_scale) <= 0.0:
+        env_cfg.object_assist.enabled = False
+    else:
+        env_cfg.object_assist.schedule = "constant"
+        env_cfg.object_assist.initial_scale = float(args.object_assist_scale)
+    # Read the width from the run's own saved config rather than pinning a
+    # literal. The object-centric reference made it 112 where every earlier run
+    # was 108, and a hard-coded number here would refuse every new checkpoint.
+    if int(env_cfg.env.num_observations) != int(SimToolRealCfg.env.num_observations):
+        raise ValueError(
+            "This checkpoint was trained with a {}D observation but the current "
+            "environment builds {}D".format(
+                env_cfg.env.num_observations,
+                SimToolRealCfg.env.num_observations,
+            )
+        )
+    if int(env_cfg.env.num_actions) != 26:
+        raise ValueError("This evaluator requires 26 AnimRL residual actions")
+
+    output_path = (
+        args.output.expanduser().resolve()
+        if args.output is not None
+        else checkpoint.parent / "eval_{}.json".format(checkpoint.stem)
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_dir = (
+        args.plot_dir.expanduser().resolve()
+        if args.plot_dir is not None
+        else checkpoint.parent / "eval_plots"
+    )
+
+    env = make_env(
+        env_cfg,
+        num_envs=None,
+        device=args.sim_device,
+        physics=args.physics,
+        visualizer=args.viz,
+    )
+    recorder = None
+    try:
+        if args.record_video:
+            video_path = (
+                args.video_path.expanduser().resolve()
+                if args.video_path is not None
+                else checkpoint.parent
+                / "eval_videos"
+                / "eval_{}_rsi_{}.mp4".format(
+                    checkpoint.stem,
+                    "sampled" if args.sampled_rsi else args.rsi_index,
+                )
+            )
+            recorder = EvaluationVideo(video_path, args.video_fps)
+            print(
+                "Recording {}x{} at {} fps to {}{}".format(
+                    int(args.video_size[0]),
+                    int(args.video_size[1]),
+                    args.video_fps,
+                    video_path,
+                    " (with the reference ghost)"
+                    if env_cfg.viewer.reference_ghost
+                    else "",
+                )
+            )
+        max_start = int(env.reference.last_index - 1)
+        if not args.sampled_rsi and not 0 <= int(args.rsi_index) <= max_start:
+            raise ValueError(
+                "--rsi-index must lie in [0, {}], got {}".format(
+                    max_start, args.rsi_index
+                )
+            )
+        # Starting at reference index k needs last_index - k transitions to
+        # reach the final sample; last_index covers the earliest possible
+        # start, and reference-end termination closes each episode on its own
+        # last transition. This replaces the saved training horizon.
+        env.max_episode_length = int(env.reference.last_index)
+        env.cfg.env.episode_length = env.max_episode_length
+
+        runner = PPO(env, train_cfg, log_dir=None, device=env.device)
+        checkpoint_infos = runner.load(
+            checkpoint, load_optimizer=False, load_normalizers=True
+        )
+        policy = runner.get_inference_policy(device=env.device)
+
+        fixed_rsi = None if args.sampled_rsi else int(args.rsi_index)
+        if fixed_rsi is not None:
+            env.reset(reference_index=fixed_rsi)
+        else:
+            env.reset()
+
+        observations = env.get_observations()
+        completed_episodes = 0
+        total_steps = 0
+        total_reward = 0.0
+        done_count = 0
+        early_count = 0
+        timeout_count = 0
+        peak_position_error = 0.0
+        peak_hand_position_error = 0.0
+        peak_object_com_height = -float("inf")
+        peak_object_com_lift = -float("inf")
+        episode_weight = 0
+        episode_totals = {}
+        trajectory = {
+            "observations": [],
+            "actions": [],
+            "rewards": [],
+            "dones": [],
+            "reference_indices": [],
+            "max_abs_position_errors": [],
+            "object_com_heights_m": [],
+            "object_com_lifts_m": [],
+        }
+        plotter = EvaluationPlotter(plot_dir) if args.plots else None
+        plot_paths = {}
+        if plotter is not None:
+            plotter.start_episode("episode_{:02d}".format(completed_episodes), env)
+
+        print("Checkpoint: {}".format(checkpoint))
+        print("Configuration: {}".format(config_path))
+        print(
+            "Evaluating deterministic mean actions: {} env(s), RSI={}".format(
+                env.num_envs,
+                "uniform" if fixed_rsi is None else fixed_rsi,
+            )
+        )
+        if fixed_rsi is None:
+            print(
+                "Playing to reference sample {} from every uniform start; "
+                "early termination disabled.".format(env.reference.last_index)
+            )
+        else:
+            transitions = int(env.reference.last_index) - fixed_rsi
+            print(
+                "Playing samples {} to {}: {} transitions ({:.2f} s), early "
+                "termination disabled.".format(
+                    fixed_rsi,
+                    env.reference.last_index,
+                    transitions,
+                    transitions * env.dt,
+                )
+            )
+        with torch.inference_mode():
+            while completed_episodes < args.episodes:
+                actions = policy(observations)
+                (
+                    observations,
+                    _,
+                    rewards,
+                    dones,
+                    infos,
+                ) = env.step(actions)
+                total_steps += 1
+                if recorder is not None:
+                    recorder.capture(env)
+                total_reward += scalar(rewards.mean())
+                step_done_count = int(dones.sum())
+                done_count += step_done_count
+                early_count += int(infos["early_termination"].sum())
+                timeout_count += int(infos["time_outs"].sum())
+                # Early termination no longer stops playback, so the tracking
+                # threshold is reported instead of enforced.
+                peak_position_error = max(
+                    peak_position_error,
+                    scalar(infos["max_abs_position_error"].max()),
+                )
+                peak_hand_position_error = max(
+                    peak_hand_position_error,
+                    scalar(infos["max_abs_hand_position_error"].max()),
+                )
+                peak_object_com_height = max(
+                    peak_object_com_height,
+                    scalar(infos["object_com_height_m"].max()),
+                )
+                peak_object_com_lift = max(
+                    peak_object_com_lift,
+                    scalar(infos["object_com_lift_m"].max()),
+                )
+
+                trajectory["observations"].append(
+                    observations[0].detach().cpu().tolist()
+                )
+                trajectory["actions"].append(
+                    actions[0].detach().cpu().tolist()
+                )
+                trajectory["rewards"].append(float(rewards[0]))
+                trajectory["dones"].append(bool(dones[0]))
+                trajectory["reference_indices"].append(
+                    int(infos["reference_index"][0])
+                )
+                trajectory["max_abs_position_errors"].append(
+                    float(infos["max_abs_position_error"][0])
+                )
+                trajectory["object_com_heights_m"].append(
+                    float(infos["object_com_height_m"][0])
+                )
+                trajectory["object_com_lifts_m"].append(
+                    float(infos["object_com_lift_m"][0])
+                )
+                if plotter is not None:
+                    plotter.record(
+                        env, total_steps, actions, rewards, dones, infos
+                    )
+
+                if "episode" in infos:
+                    episode = infos["episode"]
+                    completed = int(episode["completed_episodes"])
+                    completed_episodes += completed
+                    episode_weight += completed
+                    for name, value in episode.items():
+                        if name == "completed_episodes":
+                            continue
+                        episode_totals[name] = episode_totals.get(name, 0.0) + (
+                            scalar(value) * completed
+                        )
+                    if plotter is not None:
+                        plot_paths = plotter.finalize(termination_reason(infos))
+                        if completed_episodes < args.episodes:
+                            plotter.start_episode(
+                                "episode_{:02d}".format(completed_episodes), env
+                            )
+                    if fixed_rsi is not None and completed_episodes < args.episodes:
+                        env.reset(reference_index=fixed_rsi)
+                        observations = env.get_observations()
+
+                if args.print_every > 0 and total_steps % args.print_every == 0:
+                    print(
+                        "step {:5d} | reward {:.6f} | max q error {:.6f} rad "
+                        "| completed {}".format(
+                            total_steps,
+                            scalar(rewards.mean()),
+                            scalar(infos["max_abs_position_error"].max()),
+                            completed_episodes,
+                        )
+                    )
+                if args.viewer and env.viewer_closed():
+                    print("Viewer closed before the requested episodes completed")
+                    break
+
+        if plotter is not None and completed_episodes < args.episodes:
+            # The loop broke out early (viewer closed); keep whatever the
+            # partial episode recorded rather than discarding it.
+            plot_paths = plotter.finalize("stopped") or plot_paths
+
+        episode_metrics = {
+            name: total / episode_weight
+            for name, total in episode_totals.items()
+        } if episode_weight else {}
+        result = {
+            "checkpoint": str(checkpoint),
+            "config": str(config_path),
+            "checkpoint_infos": checkpoint_infos,
+            "deterministic": True,
+            "seed": int(args.seed),
+            "num_envs": env.num_envs,
+            "rsi": "uniform" if fixed_rsi is None else fixed_rsi,
+            "final_reference_index": int(env.reference.last_index),
+            "requested_episodes": int(args.episodes),
+            "completed_episodes": completed_episodes,
+            "environment_steps": total_steps,
+            "mean_step_reward": total_reward / max(total_steps, 1),
+            "done_count": done_count,
+            "early_termination_count": early_count,
+            "timeout_count": timeout_count,
+            "peak_position_error": peak_position_error,
+            "peak_hand_position_error": peak_hand_position_error,
+            "peak_object_com_height_m": peak_object_com_height,
+            "peak_object_com_lift_m": peak_object_com_lift,
+            # The arm's criterion moved to task space, so this is a distance
+            # in metres and peak_position_error (radians) can no longer be
+            # compared against it.
+            "termination_threshold": float(
+                env_cfg.termination.palm_keypoint_threshold_m
+            ),
+            "hand_termination_threshold": float(
+                env_cfg.termination.hand_position_threshold_rad
+            ),
+            "exceeded_termination_threshold": False,
+            "exceeded_hand_termination_threshold": bool(
+                peak_hand_position_error
+                > float(env_cfg.termination.hand_position_threshold_rad)
+            ),
+            "episode_metrics": episode_metrics,
+            "trajectory_env_0": trajectory,
+            "plot_paths": plot_paths,
+            "video_path": str(recorder.path) if recorder is not None else None,
+        }
+        with output_path.open("w", encoding="utf-8") as output_file:
+            json.dump(result, output_file, indent=2, sort_keys=True)
+
+        print("Evaluation complete")
+        print("  completed episodes : {}".format(completed_episodes))
+        print("  environment steps  : {}".format(total_steps))
+        print("  mean step reward   : {:.6f}".format(result["mean_step_reward"]))
+        # Reported as a diagnostic only. The arm's termination criterion is the
+        # palm keypoint RMS in metres, so there is no radian threshold left to
+        # compare this against -- printing one beside it claimed a limit that
+        # does not exist.
+        print("  peak |q error| arm : {:.6f} rad (diagnostic; the arm now "
+              "terminates on a {:.2f} m palm keypoint error)".format(
+                  peak_position_error, result["termination_threshold"]))
+        print("  peak |q error| hand: {:.6f} rad (threshold {:.2f}{})".format(
+            peak_hand_position_error,
+            result["hand_termination_threshold"],
+            ", EXCEEDED" if result["exceeded_hand_termination_threshold"] else "",
+        ))
+        print("  peak cube COM z    : {:.6f} m".format(peak_object_com_height))
+        print("  peak cube COM lift : {:.6f} m".format(peak_object_com_lift))
+        if episode_metrics:
+            print("  mean return        : {:.6f}".format(
+                episode_metrics["return"]
+            ))
+            print("  mean episode length: {:.2f}".format(
+                episode_metrics["length"]
+            ))
+        print("  output             : {}".format(output_path))
+        if plot_paths.get("episode_dir"):
+            print("  plots              : {}".format(plot_paths["episode_dir"]))
+        if recorder is not None:
+            print("  video              : {} ({:.1f} s, {} frames)".format(
+                recorder.path, recorder.duration_s, recorder.frames
+            ))
+    finally:
+        # Closed before the simulation so a run interrupted mid-episode still
+        # leaves a playable file behind.
+        if recorder is not None:
+            recorder.close()
+        env.close()
+
+
+if __name__ == "__main__":
+    main()

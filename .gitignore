@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+logs/
+wandb/
+# Isaac Lab checkout and its virtual environment (setup.sh recreates them)
+deps/
+# Generated from assets/urdf by scripts/convert_urdf.py
+assets/usd/
+assets/ur5e_right_dg5f.urdf
+# Large offline artefacts
+banks/*.bak*
