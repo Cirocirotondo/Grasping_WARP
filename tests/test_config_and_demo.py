@@ -70,14 +70,14 @@ class ConfigAndDemoTest(unittest.TestCase):
             "palm_tilt_weight": 0.0,
             "palm_tilt_std_rad": 0.6,
             "ee_action_rate_weight": 0.2,
-            "ee_action_rate_std": 0.03,
+            "ee_action_rate_std": 1.0,
             "arm_joint_rate_weight": 0.05,
             "arm_joint_rate_std_rad": 0.02,
             # Ships off: the feasibility pressure is meant to arrive through the
             # keypoint tracking reward, not through an explicit penalty.
             "ik_residual_weight": 0.0,
             "ik_residual_std": 0.01,
-            "position_hand_weight": 0.05,
+            "position_hand_weight": 0.3,
             "velocity_hand_weight": 0.12,
             "hand_action_rate_weight": 0.12,
             "position_hand_std_rad": 0.223607,
@@ -97,12 +97,13 @@ class ConfigAndDemoTest(unittest.TestCase):
             self.assertFalse(hasattr(env_cfg.rewards, name))
         self.assertEqual(env_cfg.rewards.object_position_weight, 0.8)
         self.assertEqual(env_cfg.rewards.object_orientation_weight, 0.4)
-        # Light pre-grasp shaping toward the bar as measured.
+        # Pre-grasp shaping toward the bar as measured, tight enough that a
+        # fingertip hovering 3 cm off the surface is not already satisfied.
         self.assertEqual(
-            env_cfg.rewards.fingertip_object_distance_weight, 0.2
+            env_cfg.rewards.fingertip_object_distance_weight, 0.3
         )
         self.assertEqual(
-            env_cfg.rewards.fingertip_object_distance_std_m, 0.04
+            env_cfg.rewards.fingertip_object_distance_std_m, 0.02
         )
         self.assertEqual(
             env_cfg.rewards.fingertip_object_distance_names,
@@ -112,7 +113,7 @@ class ConfigAndDemoTest(unittest.TestCase):
         self.assertEqual(env_cfg.rewards.object_position_std_m, 0.05)
         self.assertEqual(env_cfg.rewards.object_orientation_std_rad, 0.5)
         self.assertTrue(env_cfg.termination.object_position_enabled)
-        self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.07)
+        self.assertEqual(env_cfg.termination.object_position_threshold_m, 0.12)
         self.assertTrue(env_cfg.termination.enabled)
         # Task space, not joint space: the reward deliberately lets the arm
         # leave the retargeted joint angles.

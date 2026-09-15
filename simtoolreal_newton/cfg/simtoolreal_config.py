@@ -517,8 +517,15 @@ class SimToolRealCfg(BaseEnvCfg):
         # is close to free. Ten times rougher scores 0.705 and a hundred times
         # 0.030, so genuine flicker is what this actually charges for. The 5.0
         # this replaces was inert: it scored 0.99999 on everything.
+        #
+        # 0.03 was inert the other way round: the twist saturates at |a| <= 1
+        # direction-preservingly, so the policy's raw outputs grew unbounded
+        # and its deterministic step-to-step RMS sat at ~2.9 -- the term read
+        # 0.000 for whole episodes with no gradient to climb out of, as the
+        # hand's did at 0.2. 1.0 puts that policy on the slope (MSE ~8 scores
+        # 0.02, a 3x smoother one 0.6) while demo-like smoothness stays free.
         ee_action_rate_weight = 0.2
-        ee_action_rate_std = 0.03
+        ee_action_rate_std = 1.0
         # The solver's own output at consecutive times, q_target,t - q_target,t-1,
         # measured after the per-joint and joint-limit clamps so a truncated
         # command is scored on what was actually commanded. What the solver could
@@ -537,7 +544,14 @@ class SimToolRealCfg(BaseEnvCfg):
         ik_residual_weight = 0.0
         ik_residual_std = 0.01
 
-        position_hand_weight = 0.05
+        # Hand joint imitation. 0.05 let the fingers settle into a curl that
+        # hovers 3 cm off the bar for the whole grasp phase (hand_position
+        # reward 0.95 -> 0.06 across the approach -> lift transition of the
+        # proximity02_notilt run) while the fingertip keypoints, at sigma
+        # 0.025 m, were still 73% satisfied 2 cm short of contact. The demo's
+        # joint configuration is a closed grasp; the joint-imitation recipe that
+        # learned the lift weighted it 0.38 net.
+        position_hand_weight = 0.3
         velocity_hand_weight = 0.12
         hand_action_rate_weight = 0.12
         position_hand_std_rad = 0.223607
@@ -578,10 +592,9 @@ class SimToolRealCfg(BaseEnvCfg):
         # chases the policy indefinitely is how blind_sharp traded its grasp
         # away for tracking it did not need.
         adaptive_sigma_position_hand_floor = 0.0103
-        # A 3x shrink below ee_action_rate_std's new 0.03. The 0.0076 this
-        # replaces was measured against joint-space action deltas and means
-        # nothing now that the arm's action is a twist.
-        adaptive_sigma_ee_action_rate_floor = 0.01
+        # A 3x shrink below ee_action_rate_std's 1.0, matching the hand floor
+        # below. Inert while adaptive_sigma_enabled is False.
+        adaptive_sigma_ee_action_rate_floor = 0.33
         # A 3x shrink below hand_action_rate_std's new 1.0, matching how the
         # ee floor above is set. The 0.0076 this replaces was calibrated when
         # the width was 5 and inert; leaving it would have let an adaptive run
@@ -599,10 +612,15 @@ class SimToolRealCfg(BaseEnvCfg):
         # Fingertip-object distance rewards. Point-to-box distance of the three
         # named fingertips to the bar as measured, gated to the pre-grasp region
         # (reference_index >= the RSI pre-grasp start) so it does not pull the
-        # hand into the bar during the approach. 0.2 is the weight of the
-        # joint-imitation (DeepMimic-style) recipe that learned the lift.
-        fingertip_object_distance_weight = 0.2 * object_scale
-        fingertip_object_distance_std_m = 0.04
+        # hand into the bar during the approach. The joint-imitation
+        # (DeepMimic-style) recipe that learned the lift used 0.2 at sigma 0.04;
+        # at that width a fingertip hovering 3 cm off the bar still scored 0.75,
+        # which is where proximity02_notilt parked all three fingers for the
+        # whole grasp phase. The reference fingertips sit 1.2-1.4 cm from the
+        # surface (the pad radius, i.e. touching); 0.02 scores 3 cm at 0.32 and
+        # 1.3 cm at 0.81, so the gradient reaches contact.
+        fingertip_object_distance_weight = 0.3 * object_scale
+        fingertip_object_distance_std_m = 0.02
         fingertip_object_distance_names = ["thumb", "index", "middle"]
 
     class termination:
@@ -627,8 +645,14 @@ class SimToolRealCfg(BaseEnvCfg):
         hand_position_threshold_rad = 1.35
         # End an episode when the physical cube remains farther than this
         # Euclidean center distance from the demonstrated cube target.
+        #
+        # The reference bar rises at ~1.3 mm/frame, so this is also the window
+        # a policy gets to discover the lift: 0.07 m gave ~55 frames and ended
+        # 87% of proximity02_notilt's episodes, which taught the fingers that
+        # nudging the bar is fatal and to hover instead. 0.12 m roughly doubles
+        # the window and makes a bumped bar recoverable.
         object_position_enabled = True
-        object_position_threshold_m = 0.07
+        object_position_threshold_m = 0.12
         grace_steps = 5
 
 
