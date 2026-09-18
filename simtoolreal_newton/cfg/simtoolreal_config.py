@@ -181,6 +181,13 @@ class SimToolRealCfg(BaseEnvCfg):
         # anchor value with its probability, else the uniform draw. Combined
         # with scale_nominal_probability (which is the pair [1.0, p]).
         scale_anchors = []
+        # Ablation (wave S3): when set, the policy observation carries this
+        # constant instead of the episode's true factor while the physics keeps
+        # the true one -- evaluate a physical 0.8 bar while telling the policy
+        # 1.2, and the reverse, to measure how much the scale column is used.
+        # None = the policy is told the truth. Only meaningful with
+        # observe_scale, and it is a sweep/evaluation knob, not a training one.
+        observed_scale_override = None
         # Relative to the repository root. Built offline rather than at startup:
         # solving hundreds of clips takes minutes, and a transform must be
         # proven feasible over the clip's whole length before an episode is

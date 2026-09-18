@@ -62,6 +62,7 @@ from simtoolreal_newton.envs.object_scale import (
     mass_factor,
     object_scale_observation_dim,
     observe_scale,
+    observed_scale_override,
     reference_height_shift,
     sample_scales,
     scale_observation,
@@ -319,6 +320,8 @@ class MotionImitationEnv(DirectRLEnv):
         self.object_scale_range = scale_range(randomization_cfg)
         self.object_scale_enabled = scale_randomization_enabled(randomization_cfg)
         self.object_scale_observed = observe_scale(randomization_cfg)
+        # Ablation: what the policy is *told* the scale is. None = the truth.
+        self.object_scale_observation_override = observed_scale_override(randomization_cfg)
         self.object_scale_mass_with_volume = bool(getattr(randomization_cfg, "scale_mass_with_volume", True))
         self.num_obs += object_scale_observation_dim(randomization_cfg)
         self.critic_force_observation_dim = (
@@ -1491,7 +1494,9 @@ class MotionImitationEnv(DirectRLEnv):
             *self._task_space_observation_components(),
         ]
         if self.object_scale_observed:
-            parts.append(scale_observation(self.object_scale))
+            parts.append(
+                scale_observation(self.object_scale, self.object_scale_observation_override)
+            )
         self.policy_obs.copy_(torch.cat(parts, dim=1))
         # Last line of defence against a blown-up world: the env is being
         # terminated (see _get_dones), and the policy must never see NaN.

@@ -18,7 +18,7 @@ The helpers here are pure so they can be unit-tested without a simulator.
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -114,9 +114,35 @@ def reference_height_shift(scale: torch.Tensor, half_height_m: float) -> torch.T
     return float(half_height_m) * (scale - 1.0)
 
 
-def scale_observation(scale: torch.Tensor) -> torch.Tensor:
-    """The observation column: the raw factor, one per environment."""
-    return scale.reshape(-1, 1)
+def observed_scale_override(randomization_cfg) -> Optional[float]:
+    """The constant the policy is told instead of the true scale, or ``None``.
+
+    Only the observation is replaced; the physics keeps the true per-episode
+    factor. That is the ablation: run a physical 0.8 bar while telling the
+    policy 1.2 (and the other way round) to measure how much the column is
+    actually used.
+    """
+    value = getattr(randomization_cfg, "observed_scale_override", None)
+    if value is None:
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            "object_randomization.observed_scale_override must be a positive number or None"
+        )
+    return value
+
+
+def scale_observation(scale: torch.Tensor, override: Optional[float] = None) -> torch.Tensor:
+    """The observation column: the raw factor, one per environment.
+
+    ``override`` replaces every entry with that constant (see
+    :func:`observed_scale_override`).
+    """
+    column = scale.reshape(-1, 1)
+    if override is None:
+        return column
+    return torch.full_like(column, float(override))
 
 
 def expand_first_layer(weight: torch.Tensor, extra: int) -> torch.Tensor:

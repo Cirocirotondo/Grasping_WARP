@@ -2,7 +2,7 @@
 
 import torch.nn as nn
 
-from .policy import get_activation
+from .policy import first_linear, get_activation
 
 
 class Value(nn.Module):
@@ -13,6 +13,7 @@ class Value(nn.Module):
         num_obs,
         hidden_dims=None,
         activation="elu",
+        split_input_index=None,
         device="cpu",
         **kwargs
     ):
@@ -22,7 +23,7 @@ class Value(nn.Module):
             hidden_dims = [256, 256]
 
         layers = [
-            nn.Linear(num_obs, hidden_dims[0]).to(device),
+            first_linear(num_obs, hidden_dims[0], split_input_index, device),
             get_activation(activation),
         ]
         for index in range(len(hidden_dims)):

@@ -16,6 +16,10 @@ from simtoolreal_newton.runners.deployment_score import (
 )
 from simtoolreal_newton.runners.modules.normalizer import EmpiricalNormalization
 from simtoolreal_newton.runners.modules.policy import Policy
+from simtoolreal_newton.runners.modules.split_input_linear import (
+    fused_parameter_slots,
+    split_input_layers,
+)
 from simtoolreal_newton.runners.modules.value import Value
 from simtoolreal_newton.runners.storage.rollout_storage import RolloutStorage
 
@@ -117,6 +121,13 @@ class PPO:
             if self.env.num_privileged_obs is not None
             else self.env.num_obs
         )
+        self.scale_input_lr_multiplier = self._resolve_scale_input_lr_multiplier()
+        # The scale is the last policy observation. The critic sees the policy
+        # observation first and its privileged blocks after it, so the column
+        # index is the same for both networks but is not the critic's last one.
+        split_input_index = (
+            num_actor_obs - 1 if self.scale_input_lr_multiplier != 1.0 else None
+        )
         self.policy = Policy(
             num_obs=num_actor_obs,
             num_actions=self.env.num_actions,
@@ -125,12 +136,14 @@ class PPO:
             log_std_init=self.policy_cfg.log_std_init,
             max_action_std=self.policy_cfg.max_action_std,
             min_action_std=getattr(self.policy_cfg, "min_action_std", None),
+            split_input_index=split_input_index,
             device=self.device,
         ).to(self.device)
         self.value = Value(
             num_obs=num_critic_obs,
             hidden_dims=self.policy_cfg.critic_hidden_dims,
             activation=self.policy_cfg.activation,
+            split_input_index=split_input_index,
             device=self.device,
         ).to(self.device)
 
@@ -156,9 +169,13 @@ class PPO:
         )
         self.transition = RolloutStorage.Transition()
 
-        parameters = list(self.policy.parameters()) + list(self.value.parameters())
-        self.optimizer = optim.Adam(parameters, lr=self.alg_cfg.learning_rate)
         self.learning_rate = float(self.alg_cfg.learning_rate)
+        self.optimizer = optim.Adam(
+            self._parameter_groups(), lr=self.learning_rate
+        )
+        self._lr_multipliers = [
+            float(group["lr_multiplier"]) for group in self.optimizer.param_groups
+        ]
         self.total_timesteps = 0
         self.total_time_s = 0.0
         self.best_evaluation_score = -math.inf
@@ -167,6 +184,155 @@ class PPO:
         self.best_evaluation_iteration = -1
         self.divergence_streak = 0
         self.env.reset()
+
+    def _resolve_scale_input_lr_multiplier(self):
+        """The scale column's learning-rate factor, or 1.0 when it cannot apply."""
+        multiplier = float(
+            getattr(self.policy_cfg, "scale_input_lr_multiplier", 1.0)
+        )
+        if not math.isfinite(multiplier) or multiplier <= 0.0:
+            raise ValueError(
+                "train.policy.scale_input_lr_multiplier must be a positive number"
+            )
+        if multiplier == 1.0:
+            return 1.0
+        if not bool(getattr(self.env, "object_scale_observed", False)):
+            print(
+                "train.policy.scale_input_lr_multiplier={:g} ignored: this "
+                "environment does not observe the cuboid scale".format(multiplier)
+            )
+            return 1.0
+        return multiplier
+
+    def _apply_learning_rate(self):
+        """Push ``self.learning_rate`` onto every group, keeping its ratio.
+
+        The scale column's group runs at ``learning_rate * lr_multiplier``, so
+        the adaptive schedule has to scale both rates rather than overwrite
+        them with one value.
+        """
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.learning_rate * group.get("lr_multiplier", 1.0)
+
+    def _parameter_groups(self):
+        """One group per learning rate: everything, and the scale column.
+
+        ``lr_multiplier`` travels with the group so the adaptive schedule can
+        move both rates together without knowing which group is which.
+        """
+        parameters = list(self.policy.parameters()) + list(self.value.parameters())
+        split = [
+            layer.weight_split
+            for layer in split_input_layers(self.policy, self.value)
+        ]
+        split_ids = {id(parameter) for parameter in split}
+        groups = [
+            {
+                "params": [p for p in parameters if id(p) not in split_ids],
+                "lr": self.learning_rate,
+                "lr_multiplier": 1.0,
+            }
+        ]
+        if split:
+            multiplier = float(self.scale_input_lr_multiplier)
+            groups.append(
+                {
+                    "params": split,
+                    "lr": self.learning_rate * multiplier,
+                    "lr_multiplier": multiplier,
+                }
+            )
+            print(
+                "Scale observation column: {} parameters at {:g}x the learning "
+                "rate ({:g})".format(
+                    len(split), multiplier, self.learning_rate * multiplier
+                )
+            )
+        return groups
+
+    def _load_optimizer_state(self, saved):
+        """Restore the optimizer, tolerating a checkpoint saved without the split.
+
+        A checkpoint from before the scale column had its own parameter holds
+        one fused Adam moment per first layer, which no longer matches any
+        single parameter. Those moments are dropped (the split layers restart
+        from zero, as a freshly widened column does anyway) and every other
+        parameter keeps its state.
+        """
+        saved_groups = list(saved.get("param_groups", []))
+        groups = self.optimizer.param_groups
+        if len(saved_groups) == len(groups) and all(
+            len(a.get("params", [])) == len(b["params"])
+            for a, b in zip(saved_groups, groups)
+        ):
+            self.optimizer.load_state_dict(saved)
+        else:
+            adapted = self._adapt_optimizer_state(saved)
+            if adapted is not None:
+                self.optimizer.load_state_dict(adapted)
+        # load_state_dict replaces the group dictionaries with the saved ones,
+        # which may predate lr_multiplier or carry a different one: this run's
+        # configuration decides the ratio, the checkpoint the base rate.
+        groups = self.optimizer.param_groups
+        base_lr = float(groups[0]["lr"])
+        for group, multiplier in zip(groups, self._lr_multipliers):
+            group["lr_multiplier"] = multiplier
+            group["lr"] = base_lr * multiplier
+
+    def _adapt_optimizer_state(self, saved):
+        """Map a pre-split optimizer state onto the current parameters, or None."""
+        slots = fused_parameter_slots(self.policy, self.value)
+        saved_groups = list(saved.get("param_groups", []))
+        saved_count = sum(len(group.get("params", [])) for group in saved_groups)
+        if (
+            len(saved_groups) != 1
+            or saved_count != len(slots)
+            or not any(len(slot) > 1 for slot in slots)
+        ):
+            print(
+                "Optimizer state ignored: its {} parameter group(s) with {} "
+                "tensors do not match this run's networks; the Adam moments "
+                "restart from zero.".format(len(saved_groups), saved_count)
+            )
+            return None
+
+        index_of = {}
+        for index, parameter in enumerate(
+            parameter for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        ):
+            index_of[id(parameter)] = index
+        saved_state = saved.get("state", {})
+        state = {}
+        dropped = 0
+        for old_index, slot in enumerate(slots):
+            entry = saved_state.get(old_index, saved_state.get(str(old_index)))
+            if entry is None:
+                continue
+            if len(slot) != 1:
+                dropped += 1
+                continue
+            state[index_of[id(slot[0])]] = entry
+        hyperparameters = {
+            key: value
+            for key, value in saved_groups[0].items()
+            if key not in ("params", "lr", "lr_multiplier")
+        }
+        saved_lr = float(saved_groups[0].get("lr", self.learning_rate))
+        param_groups = []
+        for group in self.optimizer.param_groups:
+            multiplier = float(group.get("lr_multiplier", 1.0))
+            packed = dict(hyperparameters)
+            packed["lr"] = saved_lr * multiplier
+            packed["lr_multiplier"] = multiplier
+            packed["params"] = [index_of[id(p)] for p in group["params"]]
+            param_groups.append(packed)
+        print(
+            "Optimizer state adapted to the split scale column: the Adam "
+            "moments of {} first-layer weight(s) were dropped, {} tensors "
+            "kept.".format(dropped, len(state))
+        )
+        return {"state": state, "param_groups": param_groups}
 
     def collect_rollout(self):
         """Collect one AnimRL rollout and compute normalized GAE returns."""
@@ -404,8 +570,7 @@ class PPO:
                         self.learning_rate = min(
                             1.0e-2, self.learning_rate * 1.5
                         )
-                    for group in self.optimizer.param_groups:
-                        group["lr"] = self.learning_rate
+                    self._apply_learning_rate()
 
             ratio = torch.exp(
                 actions_log_prob - torch.squeeze(old_actions_log_prob)
@@ -974,7 +1139,7 @@ class PPO:
         self.policy.load_state_dict(loaded["policy_dict"])
         self.value.load_state_dict(loaded["value_dict"])
         if load_optimizer:
-            self.optimizer.load_state_dict(loaded["optimizer_state_dict"])
+            self._load_optimizer_state(loaded["optimizer_state_dict"])
             # Only a training resume restores the adapted reward widths; an
             # evaluation keeps the configured ones (they only shape reward).
             trackers = getattr(self.env, "adaptive_sigmas", {}) or {}

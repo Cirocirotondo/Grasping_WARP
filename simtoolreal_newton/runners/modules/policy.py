@@ -9,6 +9,23 @@ from simtoolreal_newton.runners.utils.distributions import (
     DiagGaussianDistribution,
 )
 
+from .split_input_linear import SplitInputLinear
+
+
+def first_linear(num_obs, out_features, split_input_index=None, device="cpu"):
+    """The input layer: plain ``Linear``, or one with a column split out.
+
+    ``split_input_index`` names the observation column that gets its own
+    parameter (and so its own learning rate); ``None`` builds exactly the
+    ``nn.Linear`` every earlier run used. Either way the layer saves and loads
+    one fused ``weight`` of shape ``(out_features, num_obs)``.
+    """
+    if split_input_index is None:
+        return nn.Linear(num_obs, out_features).to(device)
+    return SplitInputLinear(
+        num_obs, out_features, split_start=int(split_input_index), split_size=1
+    ).to(device)
+
 
 def get_activation(name):
     activations = {
@@ -37,6 +54,7 @@ class Policy(nn.Module):
         log_std_init=0.0,
         max_action_std=None,
         min_action_std=None,
+        split_input_index=None,
         device="cpu",
         **kwargs
     ):
@@ -47,7 +65,7 @@ class Policy(nn.Module):
         activation_module = get_activation(activation)
 
         layers = [
-            nn.Linear(num_obs, hidden_dims[0]).to(device),
+            first_linear(num_obs, hidden_dims[0], split_input_index, device),
             activation_module,
         ]
         for index in range(len(hidden_dims) - 1):

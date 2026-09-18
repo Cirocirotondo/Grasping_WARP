@@ -195,6 +195,17 @@ class BaseTrainCfg(ABCConfig):
         # exploration dies before the policy is done. A floor keeps it alive
         # without the runaway inflation entropy_coef 0.001 produced (1.7).
         min_action_std = None
+        # Own learning rate for the scale observation column (branch
+        # generalize_size). A checkpoint widened from 112 to 113 inputs starts
+        # that column at zero weight, and Adam bounds every element's step by
+        # the learning rate, so at lr 5e-6 the column reached norm 0.19 after
+        # 300 iterations against a median 1.38 for the other columns: the
+        # policy stays nearly scale-blind. With a multiplier != 1 the first
+        # layer of the actor and of the critic keeps that one input column in
+        # its own parameter, in its own optimizer group, at
+        # learning_rate * multiplier. 1.0 = one plain Linear exactly as before;
+        # the state_dict keys and shapes are the same either way.
+        scale_input_lr_multiplier = 1.0
         actor_hidden_dims = [512, 256]
         critic_hidden_dims = [512, 256]
         activation = "elu"
