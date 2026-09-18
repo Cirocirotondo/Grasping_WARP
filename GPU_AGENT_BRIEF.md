@@ -460,8 +460,8 @@ waves did, then **verify the run's `config.json` against the seed's**
 (`logs/staged/w6_s7_cont2_it17000_scale/config.json`): rewards, RSI, contact,
 pose list length 2392, and `observation_dim` 113 for the observed arms.
 Video recording on (`--record-video`); at the first clip (iteration 17500)
-check whether the rendered bar looks scaled and say so in your notes — the
-physics is right either way (smoke-tested), the renderer may not follow.
+(settled 11:50: the renderer follows the scale — the bar is 55/68/82 px in
+the 0.8/1.0/1.2 clips — so no check is needed).
 
 **Arms:**
 

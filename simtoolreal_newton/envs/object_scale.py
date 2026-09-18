@@ -56,7 +56,20 @@ def sample_scales(count: int, randomization_cfg, device, generator=None) -> torc
     if abs(high - low) <= 1e-12:
         return torch.full((count,), low, dtype=torch.float32, device=device)
     draw = torch.rand(count, dtype=torch.float32, device=device, generator=generator)
-    return low + (high - low) * draw
+    scales = low + (high - low) * draw
+    nominal = nominal_probability(randomization_cfg)
+    if nominal > 0.0:
+        pick = torch.rand(count, dtype=torch.float32, device=device, generator=generator) < nominal
+        scales = torch.where(pick, torch.ones_like(scales), scales)
+    return scales
+
+
+def nominal_probability(randomization_cfg) -> float:
+    """Fraction of episodes that keep the nominal bar (scale 1.0) -- the scale anchor."""
+    value = float(getattr(randomization_cfg, "scale_nominal_probability", 0.0))
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError("object_randomization.scale_nominal_probability must lie in [0, 1]")
+    return value
 
 
 def mass_factor(scale: torch.Tensor, with_volume: bool) -> torch.Tensor:

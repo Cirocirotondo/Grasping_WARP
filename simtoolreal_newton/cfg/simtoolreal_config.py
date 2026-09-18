@@ -171,6 +171,11 @@ class SimToolRealCfg(BaseEnvCfg):
         scale_max = 1.0
         scale_mass_with_volume = True
         observe_scale = False
+        # Scale anchor (wave S2): this fraction of episodes uses the nominal
+        # bar (factor exactly 1.0) instead of a uniform draw, the way the
+        # pose list over-samples pose 122 -- keeps the policy pinned to the
+        # demonstration's bar while it learns the others. 0 = plain uniform.
+        scale_nominal_probability = 0.0
         # Relative to the repository root. Built offline rather than at startup:
         # solving hundreds of clips takes minutes, and a transform must be
         # proven feasible over the clip's whole length before an episode is

@@ -58,6 +58,20 @@ class ObjectScaleTest(unittest.TestCase):
         self.assertTrue(torch.allclose(fixed, torch.full((5,), 1.2)))
         self.assertEqual(sample_scales(0, _Cfg(0.8, 1.2), "cpu").numel(), 0)
 
+    def test_nominal_anchor_fraction(self):
+        cfg = _Cfg(0.8, 1.2)
+        cfg.scale_nominal_probability = 0.25
+        generator = torch.Generator().manual_seed(5)
+        draws = sample_scales(20000, cfg, "cpu", generator=generator)
+        nominal = float((draws == 1.0).float().mean())
+        self.assertAlmostEqual(nominal, 0.25, delta=0.02)
+        others = draws[draws != 1.0]
+        self.assertGreaterEqual(float(others.min()), 0.8)
+        self.assertLessEqual(float(others.max()), 1.2)
+        cfg.scale_nominal_probability = 1.5
+        with self.assertRaises(ValueError):
+            sample_scales(4, cfg, "cpu")
+
     def test_physical_factors(self):
         scale = torch.tensor([0.8, 1.0, 1.2])
         self.assertTrue(torch.allclose(mass_factor(scale, True), scale**3))
