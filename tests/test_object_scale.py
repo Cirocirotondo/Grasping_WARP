@@ -72,6 +72,18 @@ class ObjectScaleTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             sample_scales(4, cfg, "cpu")
 
+    def test_anchor_table_with_extra_anchors(self):
+        cfg = _Cfg(0.8, 1.2)
+        cfg.scale_nominal_probability = 0.25
+        cfg.scale_anchors = [[1.2, 0.15]]
+        generator = torch.Generator().manual_seed(9)
+        draws = sample_scales(40000, cfg, "cpu", generator=generator)
+        self.assertAlmostEqual(float((draws == 1.0).float().mean()), 0.25, delta=0.015)
+        self.assertAlmostEqual(float((draws == 1.2).float().mean()), 0.15, delta=0.015)
+        cfg.scale_anchors = [[1.2, 0.9]]
+        with self.assertRaises(ValueError):
+            sample_scales(4, cfg, "cpu")
+
     def test_physical_factors(self):
         scale = torch.tensor([0.8, 1.0, 1.2])
         self.assertTrue(torch.allclose(mass_factor(scale, True), scale**3))

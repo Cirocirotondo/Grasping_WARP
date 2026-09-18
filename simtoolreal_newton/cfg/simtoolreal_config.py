@@ -176,6 +176,11 @@ class SimToolRealCfg(BaseEnvCfg):
         # pose list over-samples pose 122 -- keeps the policy pinned to the
         # demonstration's bar while it learns the others. 0 = plain uniform.
         scale_nominal_probability = 0.0
+        # General form of the anchor (S2, 18:00): a list of [scale, probability]
+        # pairs, e.g. [[1.0, 0.25], [1.2, 0.15]] -- each episode picks the
+        # anchor value with its probability, else the uniform draw. Combined
+        # with scale_nominal_probability (which is the pair [1.0, p]).
+        scale_anchors = []
         # Relative to the repository root. Built offline rather than at startup:
         # solving hundreds of clips takes minutes, and a transform must be
         # proven feasible over the clip's whole length before an episode is

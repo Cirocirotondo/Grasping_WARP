@@ -57,11 +57,36 @@ def sample_scales(count: int, randomization_cfg, device, generator=None) -> torc
         return torch.full((count,), low, dtype=torch.float32, device=device)
     draw = torch.rand(count, dtype=torch.float32, device=device, generator=generator)
     scales = low + (high - low) * draw
+    anchors = anchor_table(randomization_cfg)
+    if anchors:
+        # One draw decides which anchor (if any) an episode takes: the
+        # probabilities are cumulative slices of [0, 1).
+        pick = torch.rand(count, dtype=torch.float32, device=device, generator=generator)
+        lower = 0.0
+        for value, probability in anchors:
+            chosen = (pick >= lower) & (pick < lower + probability)
+            scales = torch.where(chosen, torch.full_like(scales, float(value)), scales)
+            lower += probability
+    return scales
+
+
+def anchor_table(randomization_cfg):
+    """``[(scale, probability), ...]``: the nominal anchor plus ``scale_anchors``; total ≤ 1."""
+    table = []
     nominal = nominal_probability(randomization_cfg)
     if nominal > 0.0:
-        pick = torch.rand(count, dtype=torch.float32, device=device, generator=generator) < nominal
-        scales = torch.where(pick, torch.ones_like(scales), scales)
-    return scales
+        table.append((1.0, nominal))
+    for entry in list(getattr(randomization_cfg, "scale_anchors", []) or []):
+        value, probability = float(entry[0]), float(entry[1])
+        if not (math.isfinite(value) and value > 0.0):
+            raise ValueError("scale_anchors values must be positive")
+        if not (math.isfinite(probability) and 0.0 <= probability <= 1.0):
+            raise ValueError("scale_anchors probabilities must lie in [0, 1]")
+        if probability > 0.0:
+            table.append((value, probability))
+    if sum(p for _, p in table) > 1.0 + 1e-9:
+        raise ValueError("scale anchor probabilities must not exceed 1 in total")
+    return table
 
 
 def nominal_probability(randomization_cfg) -> float:

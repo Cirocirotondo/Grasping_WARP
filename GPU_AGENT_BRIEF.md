@@ -498,3 +498,52 @@ dir>/eval_videos/eval_model_<N>_rsi_0_scale<S>.mp4`), plus RSI 760 at 0.8 and
 
 Everything else in this brief (supervision protocol, notes, reports,
 ladders, stop rules) is unchanged. Run names start with `s1_`.
+
+## 12. Wave S2 — scale anchor and short budgets (from 2026-09-18 17:05 CEST)
+
+What S1 taught (five arms, three hosts): the resume from model_17000 with
+scaled bars peaks at **+200/+300** and then trades the anchor away — contact
+fraction rises while the near-band collapses; the policy learns to touch bars
+of every size and forgets where to put them. Seeds decide whether the peak
+exists (42 kept the anchor at +200 on every host; 7 dived and recovered late;
+3 lost it by +500). Nothing beyond +500 has ever been the best rung. The
+scale observation is needed (the no-observation control never re-anchored).
+Best rungs so far: tars s42 17300 (0.8 → fail@7 0.452, 1.0 → 0.428, no pose
+beyond 10 cm at 1.0), desktop [0.7,1.3] s42 17200 (0.540 / 0.284 / 0.514,
+pose 122 250/250/244).
+
+**New lever (commit 6abcc43, on the mirrors):**
+`object_randomization.scale_nominal_probability=P` keeps a fraction P of the
+episodes at the nominal bar (factor exactly 1.0), the others uniform in
+[scale_min, scale_max] — the scale analogue of the pose-122 anchoring that
+made the pose widening reproducible. Default 0 (S1 behaviour).
+
+**S2 recipe:** §11 recipe (widened seed @17000, 19 flags, scale 0.8/1.2,
+observe_scale on, lr 2e-5 unless the arm says otherwise) plus the anchor,
+**short budget: `--target 17800`** (the peaks are early; a 4000-iteration
+budget wastes 2 h per arm), **ladder every 100 from 17100 to 17800 at the
+three scales** (a 250-pose sweep costs ~25 s on the desktop and ~1 min on a
+shared server GPU, so this is cheap), §10 by the trend rule, pose 122 /
+arm tracking / §8 videos on the best rung, final report with the per-scale
+table and the §11 baseline row. Run names start with `s2_`.
+
+| run | host | anchor P | seed | other | question |
+|---|---|---|---|---|---|
+| `s2_anchor25_s42` | desktop | 0.25 | 42 | — | does the scale anchor stop the trade-off on the seed that peaks? |
+| `s2_anchor25_s7` | first free server GPU | 0.25 | 7 | — | does it also prevent the seed-7 dive? |
+| `s2_anchor50_s42` | next free server GPU | 0.50 | 42 | — | stronger anchor: does the 0.8 side still improve? |
+| `s2_lr5e6_s42` | next free server GPU | 0 | 42 | lr 5e-6, target 18000 | control without the anchor: does a 4× smaller step widen the peak? |
+
+Success stays the §11 criterion; the operational target is a rung with
+fail@7 ≤ 0.45 at 0.8 **and** 1.2 while pose 122 stays ≥ 240/250 and the
+near-band at 1.0 stays ≥ 50/100.
+
+**§12 addendum (17:35 CEST) — pose 122 during the ladder.** On tars the S1 best
+rung (s42 17300) passed the bank grid but lost the training pose at nominal
+scale (pose 122: 250/250 at 0.8, **111/250 at 1.0, 72/250 at 1.2**), and s7's
+§9-best rung (19000) scored 0/250 on pose 122 while 18500 scored 250/250 —
+the near-band column predicted both, the bank-wide median did not. Rules:
+(1) when near-band and the §9 primary key disagree, the near-band decides;
+(2) in the S2 ladders run `sweep_one` pose 122 (RSI 0, 250 repeats) at scale
+1.0 on every 100-rung together with the grid sweep, and at 0.8/1.2 on the
+candidates; a rung below 240/250 at any scale is not a deliverable.
