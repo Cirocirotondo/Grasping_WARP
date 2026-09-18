@@ -547,3 +547,37 @@ the near-band column predicted both, the bank-wide median did not. Rules:
 (2) in the S2 ladders run `sweep_one` pose 122 (RSI 0, 250 repeats) at scale
 1.0 on every 100-rung together with the grid sweep, and at 0.8/1.2 on the
 candidates; a rung below 240/250 at any scale is not a deliverable.
+
+**§12 addendum 2 (18:05 CEST) — anchoring the large bar too.** With the
+nominal anchor at 25 % the small bar is nearly solved (tars s7 17300: 0.460 /
+0.264 / 0.510 at 0.8 / 1.0 / 1.2, pose 122 242 / 250 / 115) and the large bar,
+the easy side of the baseline, becomes the binding one: the anchor takes
+probability mass from the upper half of the range. New lever (commit 0ce5fd7):
+`object_randomization.scale_anchors=[[scale, probability], ...]` adds anchors
+beside the nominal one (total probability ≤ 1). Arm `s2_anchor2p_*` = nominal
+0.25 + `[[1.2, 0.15]]`. Rule of thumb for tie-breaks: the near-band decides
+only when it differs by ≥ 10/100; otherwise the other columns decide.
+
+**§12 addendum 3 (18:15 CEST) — sweep noise.** An identical sweep (same
+checkpoint, scale and grid) repeats to about ±0.015 in fail@7 and ±8 in the
+near-band count (solver non-determinism), and the pose-122 count to about
+±3/250. Treat a single sweep that way, and duplicate the sweep on any rung
+whose verdict turns on less than that (criterion misses "by 0.010", ties in
+median error). Pose 122 and the near-band are the robust columns.
+
+**§10 note (18:45 CEST).** `s2_anchor25_lr1e5_s42` read 0/100 at 17300 and
+7/100 at 17400 — two counts under the floor, the second higher — and 200
+iterations later produced 17600 = 0.208 / 0.232 / 0.424, the lowest bank
+errors of the campaign. The single-count rule would have killed it; the trend
+rule (amendment 3) is the one to keep. A rung can also be an isolated peak
+(its neighbours 17500/17700 are dead): always sweep ±100 before proposing one.
+
+**§12 conclusion on anchors (19:25 CEST).** Across seven anchored arms on
+three hosts the scale anchor behaves as a capacity re-allocator, not a
+regulariser: whatever probability is put on a scale, the policy buys that
+scale and sells the others (25 % at 1.0 → 0.8 and 1.0 improve, 1.2 worsens;
++15 % at 1.2 → 1.2 becomes the campaign best, 0.8 collapses with pose 122 at
+1/250). Anchors give one-rung windows. The only lever that raised all three
+scales together is the small step (lr 5e-6 → 2.5e-6): `s2_lr5e6_s42` 17300
+meets the criterion, lr 2.5e-6 gives a plateau instead of a spike. Default
+for new arms: small step, no anchor, 100-spaced ladder with pose 122.
