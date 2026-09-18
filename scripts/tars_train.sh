@@ -85,7 +85,7 @@ case "${1:-}" in
     [ $# -ge 1 ] || { echo "no arguments given" >&2; exit 1; }
     if [ "$1" = "exec" ]; then
       shift
-      name="strn_gpu${gpu}_exec_$(date +%Y%m%d_%H%M%S)"
+      name="strn_gpu${gpu}_exec_$(date +%Y%m%d_%H%M%S)_$$"
       MODE_EXEC=1 refuse_busy_gpu "${gpu}"
       docker_run "${name}" "${gpu}" "$@"
       echo "launched ${name} on ${host} GPU ${gpu}: $*"
