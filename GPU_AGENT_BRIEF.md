@@ -411,3 +411,90 @@ tell them apart. Unified rule for every check (+200/+400 on nudged resumes,
 < 10/100 AND the second is not higher than the first (or one count with
 median max error > 0.3 m). If the two are below the floor but rising, spend
 one more sweep (+200 later) before deciding.
+
+## 11. Wave S1 — cuboid scale ±20% (from 2026-09-18 11:00 CEST, branch generalize_size)
+
+The pose campaign is closed; its deliverable is `w6_ori_soft_s7_cont2/model_17000`
+(the user's choice: best arm tracking by eye; pose 122 250/250, bank fail@7
+0.396 from frame 0). **New goal: the same policy must grasp and carry the bar
+when it is scaled by a factor in [0.8, 1.2]** (same proportions), with the
+*same* training setup — same bank, same reward terms, same RSI — only the
+bar size varies per episode and the policy is told the factor.
+
+**What changed in the code** (commit 59aa96a; the mirrors have it):
+- `object_randomization.scale_min/scale_max`: one factor per episode, uniform,
+  applied to the solver-side half extents of every environment (verified: the
+  MuJoCo-Warp `geom_size` is per world), to the mass (s³) and inertia (s⁵).
+  The reference bar pose is lifted by 2.5 cm·(s−1) so a scaled bar rests on
+  the table where the demo's did; nothing else moves.
+- `object_randomization.observe_scale=true` appends the factor to the policy
+  observation (113 instead of 112). A 112-input checkpoint is widened with
+  zero columns (identical policy) by `scripts/expand_checkpoint_observation.py`;
+  the widened deliverable is staged as
+  `logs/staged/w6_s7_cont2_it17000_scale/model_17000.pt` (config.json beside it),
+  the plain one as `logs/staged/w6_s7_cont2_it17000/model_17000.pt`.
+- Sweeps and evaluations pin a scale with
+  `--set object_randomization.scale_min=S --set object_randomization.scale_max=S`.
+  `scripts/smoke_object_scale.py` is the simulator check (already passed).
+
+**Baseline to beat — model_17000 zero-shot, `sweep_grid` RSI 0, 250 poses, 7 cm gate:**
+
+| scale | fail@7 | fail@10 | median max err | near-band (y ≤ 0.05) |
+|---|---|---|---|---|
+| 0.8 | 0.748 | 0.184 | 0.083 | — |
+| 0.9 | 0.492 | 0.108 | 0.070 | — |
+| 1.0 | 0.396 | 0.088 | 0.063 | 87/100 |
+| 1.1 | 0.348 | 0.044 | 0.063 | — |
+| 1.2 | 0.376 | 0.132 | 0.065 | — |
+
+Small bars are the hard side (the fingers close on the demo's positions and
+do not squeeze a thinner bar); pose 122 alone passes 32/32 at every scale.
+
+**Recipe (all arms):** warm start from the staged seed at iteration 17000,
+`--seed-iteration 17000`, **lr 2e-5**, 4096 envs (ur5: 2048×48), and *exactly
+the deliverable's configuration* — R0 (§1) + orientation 1.2/0.6 +
+`contact.enabled=true` + palm anchor `reference` + the `mix122` pose list
+(`banks/stage1_box_mix122.json`, key `mix122`) + eval phases
+[0,0.25,0.5,0.686,0.75]. Pass them as `--set` flags exactly as the previous
+waves did, then **verify the run's `config.json` against the seed's**
+(`logs/staged/w6_s7_cont2_it17000_scale/config.json`): rewards, RSI, contact,
+pose list length 2392, and `observation_dim` 113 for the observed arms.
+Video recording on (`--record-video`); at the first clip (iteration 17500)
+check whether the rendered bar looks scaled and say so in your notes — the
+physics is right either way (smoke-tested), the renderer may not follow.
+
+**Arms:**
+
+| run | host | scale range | observe_scale | seed | budget | question |
+|---|---|---|---|---|---|---|
+| `s1_scale_u82_s7` | tars 0 | [0.8, 1.2] | on (widened seed) | 7 | 17000→21000 | does the unchanged recipe learn the size with the factor observed? |
+| `s1_scale_u82_s42` | tars 1 | [0.8, 1.2] | on | 42 | 17000→21000 | seed replicate of the main arm |
+| `s1_scale_curr_s7` | case 0 | [0.9, 1.1] then [0.8, 1.2] | on | 7 | 17000→19000, then best rung → +2000 as `s1_scale_curr_s7_wide` | does a narrow-then-wide curriculum keep the anchor better than the full range at once? |
+| `s1_scale_noobs_s7` | case 1 | [0.8, 1.2] | **off** (plain seed, 112 obs) | 7 | 17000→21000 | control: is the scale observation needed at all, or does contact feedback suffice? |
+| `s1_scale_u73_s7` | desktop | [0.7, 1.3] | on | 7 | 17000→21000 | does over-covering the range make ±20% easier? (shared GPU with the user's viewers) |
+
+**Verdict sweeps (per rung):** `sweep_grid` RSI 0 (7 cm gate, contact on) at
+scale **0.8, 1.0 and 1.2** (three runs of the sweep, ~4 min each on a shared
+GPU), plus `sweep_one` pose 122 RSI 0 at 0.8 and 1.2 on the best rung. Record
+fail@7 / fail@10 / median max error / orientation / near-band per scale.
+Ladder: every 500 at the three scales; 200 spacing around the best rung at
+scale 0.8 and 1.0. §9 ranking applies per scale; the headline is the **worst
+of the three scales**.
+**§10 doom check at scale 1.0** (near-band vs the seed's 87/100) on
+`model_17500`, then every 1000, trend rule (amendment 3) — a run that loses
+the nominal bar is dead whatever it does at 0.8.
+**Arm tracking** (the paragraph above §10): joints / palm / ee-rate at RSI 0
+on the best rung at scale 1.0 and 0.8, reference model_17000 = 0.146 / 0.029 / 0.0092.
+
+**Success (per arm):** on one rung, fail@7 ≤ 0.45 at 0.8 **and** at 1.2 with
+≤ 0.45 at 1.0, pose 122 ≥ 240/250 at every scale, palm error and ee-rate
+within 20% of the reference. Report anything that beats the baseline row at
+0.8 even if the criterion is not met.
+
+**Videos (§8) for a run that reaches or approaches the criterion:** RSI 0, 4
+poses, at scale 0.8, 1.0 and 1.2 (`--set` the scale, `--video-path <run
+dir>/eval_videos/eval_model_<N>_rsi_0_scale<S>.mp4`), plus RSI 760 at 0.8 and
+1.2. Copy the clips to the desktop under `logs/simtoolreal/<HOST>_<run>/eval_videos/`.
+
+Everything else in this brief (supervision protocol, notes, reports,
+ladders, stop rules) is unchanged. Run names start with `s1_`.
