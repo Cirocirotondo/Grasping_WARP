@@ -29,6 +29,7 @@ from isaaclab_newton.sim.schemas import MujocoCollisionCfg, MujocoRigidBodyPrope
 from simtoolreal_newton import ROOT_DIR
 from simtoolreal_newton.cfg import SimToolRealCfg
 from simtoolreal_newton.envs.contact import fingertip_force_observation_dim
+from simtoolreal_newton.envs.object_scale import object_scale_observation_dim
 from simtoolreal_newton.envs.controller import (
     ARM_JOINT_NAMES,
     HAND_JOINT_NAMES,
@@ -312,7 +313,11 @@ def make_contact_sensor_cfg() -> ContactSensorCfg:
 
 def observation_dims(animrl_cfg):
     """``(policy_dim, critic_dim_or_0)`` for the configured features."""
-    num_obs = int(animrl_cfg.env.num_observations) + fingertip_force_observation_dim(animrl_cfg.contact)
+    num_obs = (
+        int(animrl_cfg.env.num_observations)
+        + fingertip_force_observation_dim(animrl_cfg.contact)
+        + object_scale_observation_dim(animrl_cfg.object_randomization)
+    )
     critic_force = (
         3 * len(animrl_cfg.contact.fingertip_names)
         if bool(getattr(animrl_cfg.contact, "critic_observes_fingertip_forces", False))

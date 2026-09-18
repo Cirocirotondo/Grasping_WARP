@@ -18,6 +18,7 @@ from simtoolreal_newton.cfg import (
     config_to_dict,
 )
 from simtoolreal_newton.envs.contact import fingertip_force_observation_dim
+from simtoolreal_newton.envs.object_scale import object_scale_observation_dim
 from simtoolreal_newton.launch import add_env_arguments, make_env
 from simtoolreal_newton.runners.lineage import resolve_lineage
 from simtoolreal_newton.runners import (
@@ -340,6 +341,7 @@ def save_configuration(run_dir, env_cfg, train_cfg, args, lineage=None):
         "observation_dim": (
             int(env_cfg.env.num_observations)
             + fingertip_force_observation_dim(env_cfg.contact)
+            + object_scale_observation_dim(env_cfg.object_randomization)
         ),
         # Where the starting weights came from. runtime.resume alone is not
         # enough: a warm start resumes from a copy inside this very run, so

@@ -157,6 +157,20 @@ class SimToolRealCfg(BaseEnvCfg):
         # above. Training, the periodic evaluator and the video roll-outs all
         # go through that reset, so they see the same poses. Empty = the box.
         fixed_transform_indices = []
+        # Cuboid scale (branch generalize_size, 2026-09-18): one factor per
+        # episode, uniform in [scale_min, scale_max], applied to all three
+        # extents (same proportions). 1.0/1.0 = the nominal bar, no change to
+        # any run that does not set it. Mass follows the volume (s^3) and the
+        # inertia s^5 when scale_mass_with_volume is on. The reference cuboid
+        # pose is lifted by half_height * (s - 1) so the scaled bar rests on
+        # the table where the demonstration's did; bank, reward terms and RSI
+        # are untouched. observe_scale appends the factor to the policy
+        # observation (num_observations + 1); checkpoints trained without it
+        # are widened with scripts/expand_checkpoint_observation.py.
+        scale_min = 1.0
+        scale_max = 1.0
+        scale_mass_with_volume = True
+        observe_scale = False
         # Relative to the repository root. Built offline rather than at startup:
         # solving hundreds of clips takes minutes, and a transform must be
         # proven feasible over the clip's whole length before an episode is

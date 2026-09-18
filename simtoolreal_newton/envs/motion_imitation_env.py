@@ -57,6 +57,17 @@ from simtoolreal_newton.envs.controller import (
     WRIST_BODY_NAME,
     pd_gain_arrays,
 )
+from simtoolreal_newton.envs.object_scale import (
+    inertia_factor,
+    mass_factor,
+    object_scale_observation_dim,
+    observe_scale,
+    reference_height_shift,
+    sample_scales,
+    scale_observation,
+    scale_randomization_enabled,
+    scale_range,
+)
 from simtoolreal_newton.envs.cuboid_symmetry import (
     apply_cuboid_symmetry,
     canonicalize_cuboid_orientation,
@@ -208,6 +219,7 @@ class MotionImitationEnv(DirectRLEnv):
         self._read_joint_limits()
         self._allocate_buffers()
         self._apply_domain_randomization()
+        self._setup_object_scale()
         self._check_kinematic_conventions()
 
     # ------------------------------------------------------------------
@@ -301,6 +313,14 @@ class MotionImitationEnv(DirectRLEnv):
                 )
         self.contact_observation_dim = fingertip_force_observation_dim(contact)
         self.num_obs += self.contact_observation_dim
+        # Cuboid scale (generalize_size): validated here so a bad range fails
+        # at construction, applied per episode in reset_idx.
+        randomization_cfg = acfg.object_randomization
+        self.object_scale_range = scale_range(randomization_cfg)
+        self.object_scale_enabled = scale_randomization_enabled(randomization_cfg)
+        self.object_scale_observed = observe_scale(randomization_cfg)
+        self.object_scale_mass_with_volume = bool(getattr(randomization_cfg, "scale_mass_with_volume", True))
+        self.num_obs += object_scale_observation_dim(randomization_cfg)
         self.critic_force_observation_dim = (
             3 * len(contact.fingertip_names)
             if bool(getattr(contact, "critic_observes_fingertip_forces", False))
@@ -653,6 +673,11 @@ class MotionImitationEnv(DirectRLEnv):
         self.world_up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=device).expand(n, -1)
         self.robot_base_position = torch.tensor(self.animrl_cfg.init_state.pos, dtype=torch.float32, device=device)
         self.object_half_extents = torch.tensor(self.animrl_cfg.object.size_m, dtype=torch.float32, device=device) / 2.0
+        # Per-episode scale factor and the resulting per-environment half
+        # extents (generalize_size). Both stay at the nominal values until a
+        # reset draws a factor.
+        self.object_scale = torch.ones(n, dtype=torch.float32, device=device)
+        self.object_half_extents_per_env = self.object_half_extents.unsqueeze(0).repeat(n, 1)
         self.gravity_vector = torch.tensor(self.animrl_cfg.sim.gravity, dtype=torch.float32, device=device)
         mj = getattr(self.animrl_cfg.sim, "mjwarp", None)
         self.object_max_linear_velocity = float(getattr(mj, "object_max_linear_velocity", 0.0) or 0.0)
@@ -735,6 +760,10 @@ class MotionImitationEnv(DirectRLEnv):
         self.cube.set_masses_index(masses=(default_mass * mass_scale.view(n, 1)).contiguous())
         default_inertia = self.cube.data.default_inertia.torch.to(self.device)
         self.cube.set_inertias_index(inertias=(default_inertia * mass_scale.view(n, 1, 1)).contiguous())
+        # Kept for the per-episode cuboid scale, which multiplies on top of
+        # the domain-randomization mass multiplier (generalize_size).
+        self._object_nominal_mass = (default_mass * mass_scale.view(n, 1)).clone()
+        self._object_nominal_inertia = (default_inertia * mass_scale.view(n, 1, 1)).clone()
         link_scale = torch.tensor(
             [randomization.multiplier("robot_link_mass", i) for i in range(n)], dtype=torch.float32, device=self.device
         )
@@ -1012,8 +1041,67 @@ class MotionImitationEnv(DirectRLEnv):
     def previous_hand_targets(self) -> torch.Tensor:
         return self.position_targets[:, len(ARM_JOINT_NAMES) :]
 
+    # ------------------------------------------------------------------
+    # Cuboid scale (generalize_size)
+    # ------------------------------------------------------------------
+
+    def _setup_object_scale(self) -> None:
+        """Bind the cuboid's solver-side half extents so a reset can rewrite them.
+
+        Newton keeps one ``shape_scale`` per shape; the MuJoCo-Warp backend
+        copies it into the per-world ``geom_size`` whenever the solver is told
+        that shape properties changed, so every environment can carry its own
+        bar size. The binding is a torch view of the warp array: writing a row
+        changes the model in place.
+        """
+        self._object_shape_scale = None
+        if not self.object_scale_enabled:
+            return
+        import warp as wp  # noqa: PLC0415
+        from isaaclab_newton.physics import NewtonManager  # noqa: PLC0415
+
+        if not hasattr(self, "_object_nominal_mass"):
+            # Domain randomisation off: the nominal mass is the spawned one.
+            self._object_nominal_mass = self.cube.data.default_mass.torch.to(self.device).clone()
+            self._object_nominal_inertia = self.cube.data.default_inertia.torch.to(self.device).clone()
+        model = NewtonManager.get_model()
+        binding = self.cube._root_view.get_attribute("shape_scale", model)
+        self._object_shape_scale = wp.to_torch(binding).reshape(self.num_envs, -1, 3)[:, 0]
+        if self._object_shape_scale.shape != (self.num_envs, 3):
+            raise RuntimeError(
+                "Unexpected cuboid shape_scale binding shape {}".format(tuple(self._object_shape_scale.shape))
+            )
+        self._object_nominal_shape_scale = self._object_shape_scale.clone()
+
+    def _apply_object_scale(self, env_ids: torch.Tensor, scale: torch.Tensor) -> None:
+        """Write the scale factor of ``env_ids`` into the solver (geometry, mass, inertia)."""
+        scale = scale.to(device=self.device, dtype=torch.float32)
+        self.object_scale[env_ids] = scale
+        self.object_half_extents_per_env[env_ids] = self.object_half_extents.unsqueeze(0) * scale.unsqueeze(1)
+        if self._object_shape_scale is None:
+            return
+        from isaaclab_newton.physics import NewtonManager  # noqa: PLC0415
+        from newton import ModelFlags  # noqa: PLC0415
+
+        self._object_shape_scale[env_ids] = self._object_nominal_shape_scale[env_ids] * scale.unsqueeze(1)
+        ids = env_ids.to(torch.int32)
+        masses = self._object_nominal_mass[env_ids] * mass_factor(scale, self.object_scale_mass_with_volume).view(
+            -1, 1
+        )
+        inertias = self._object_nominal_inertia[env_ids] * inertia_factor(
+            scale, self.object_scale_mass_with_volume
+        ).view(-1, 1, 1)
+        self.cube.set_masses_index(masses=masses.contiguous(), env_ids=ids)
+        self.cube.set_inertias_index(inertias=inertias.contiguous(), env_ids=ids)
+        NewtonManager.add_model_change(ModelFlags.SHAPE_PROPERTIES)
+
     def _cube_reference_root_states(self, sample, env_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Convert a bank track to the episode's exact continuous transform (env frame)."""
+        """Convert a bank track to the episode's exact continuous transform (env frame).
+
+        A scaled bar rests higher on the table than the demonstration's, so
+        the reference pose is lifted by ``half_height * (scale - 1)``; the
+        rest of the track (carry, orientation) is the demonstration's.
+        """
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
         position = self.robot_base_position + sample.cube_pose[:, :3] * self.world_axis_sign
@@ -1029,6 +1117,9 @@ class MotionImitationEnv(DirectRLEnv):
         bank_start_position = self.robot_base_position + bank_start_sample.cube_pose[:, :3] * self.world_axis_sign
         actual_start_position = bank_start_position - bank_translation + self.episode_translation[env_ids]
         position = actual_start_position + _quat_rotate(delta_quaternion, position - bank_start_position)
+        if self.object_scale_enabled:
+            position = position.clone()
+            position[:, 2] += reference_height_shift(self.object_scale[env_ids], float(self.object_half_extents[2]))
         quaternion_world = _quat_multiply(delta_quaternion, quaternion_world)
         linear_velocity = _quat_rotate(delta_quaternion, sample.cube_linear_velocity * self.world_axis_sign)
         angular_velocity = _quat_rotate(delta_quaternion, sample.cube_angular_velocity * self.world_axis_sign)
@@ -1326,6 +1417,8 @@ class MotionImitationEnv(DirectRLEnv):
         self.position_targets[env_ids] = sample.q
         self.applied_targets[env_ids] = sample.q
         self.robot.actuators.target_command.set_position_index(value=sample.q.contiguous(), env_ids=ids)
+        if self.object_scale_enabled:
+            self._apply_object_scale(env_ids, sample_scales(count, randomization, self.device))
         self._reset_cube_from_reference(env_ids, sample)
         reference_root = self._cube_reference_root_states(sample, env_ids)
         _, chosen_symmetry = canonicalize_cuboid_orientation(
@@ -1390,18 +1483,16 @@ class MotionImitationEnv(DirectRLEnv):
                 self.domain_randomization.obs_q_bias_rad,
                 bias=self.observation_position_bias,
             )
-        self.policy_obs.copy_(
-            torch.cat(
-                (
-                    self.normalize_positions(measured_q),
-                    self.previous_targets,
-                    measured_dq,
-                    phase,
-                    *self._task_space_observation_components(),
-                ),
-                dim=1,
-            )
-        )
+        parts = [
+            self.normalize_positions(measured_q),
+            self.previous_targets,
+            measured_dq,
+            phase,
+            *self._task_space_observation_components(),
+        ]
+        if self.object_scale_observed:
+            parts.append(scale_observation(self.object_scale))
+        self.policy_obs.copy_(torch.cat(parts, dim=1))
         # Last line of defence against a blown-up world: the env is being
         # terminated (see _get_dones), and the policy must never see NaN.
         torch.nan_to_num_(self.policy_obs, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1502,7 +1593,7 @@ class MotionImitationEnv(DirectRLEnv):
             fingertip_object_distance_m,
             fingertip_object_distance_per_finger_m,
         ) = fingertip_cuboid_proximity(
-            selected_fingertips_cube, self.object_half_extents, self.proximity_std_m, proximity_active
+            selected_fingertips_cube, self.object_half_extents_per_env, self.proximity_std_m, proximity_active
         )
 
         keypoints_world = self._hand_keypoints_world()

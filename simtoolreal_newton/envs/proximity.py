@@ -25,17 +25,21 @@ def fingertip_cuboid_proximity(
         or fingertip_positions_cube.shape[-1] != 3
     ):
         raise ValueError("Expected fingertip positions with shape (N, F, 3)")
-    if cuboid_half_extents.shape != (3,):
-        raise ValueError("Expected cuboid half extents with shape (3,)")
+    count = fingertip_positions_cube.shape[0]
+    if cuboid_half_extents.shape == (3,):
+        half_extents = cuboid_half_extents.view(1, 1, 3)
+    elif cuboid_half_extents.shape == (count, 3):
+        # One cuboid size per environment (scaled bars).
+        half_extents = cuboid_half_extents.view(count, 1, 3)
+    else:
+        raise ValueError("Expected cuboid half extents with shape (3,) or (N, 3)")
     if active.shape != fingertip_positions_cube.shape[:1]:
         raise ValueError("Expected one proximity activation flag per environment")
     std_m = float(std_m)
     if std_m <= 0.0:
         raise ValueError("Proximity standard deviation must be positive")
 
-    outside = (
-        fingertip_positions_cube.abs() - cuboid_half_extents.view(1, 1, 3)
-    ).clamp_min(0.0)
+    outside = (fingertip_positions_cube.abs() - half_extents).clamp_min(0.0)
     distances_m = torch.linalg.vector_norm(outside, dim=2)
     per_finger_reward = torch.exp(-distances_m.square() / (2.0 * std_m**2))
     reward = per_finger_reward.mean(dim=1) * active.to(
