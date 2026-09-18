@@ -42,6 +42,10 @@ def parse_arguments():
     parser.add_argument("--output", default=str(ROOT_DIR / "banks/stage1.pt"))
     parser.add_argument("--transform-count", type=int, default=512)
     parser.add_argument("--translation-m", type=float, default=0.20)
+    parser.add_argument("--x-min-m", type=float, default=None, help="Explicit x box; overrides --translation-m.")
+    parser.add_argument("--x-max-m", type=float, default=None)
+    parser.add_argument("--y-min-m", type=float, default=None, help="Explicit y box; overrides --translation-m.")
+    parser.add_argument("--y-max-m", type=float, default=None)
     parser.add_argument("--yaw-min-deg", type=float, default=-22.5)
     parser.add_argument("--yaw-max-deg", type=float, default=90.0)
     parser.add_argument(
@@ -74,7 +78,12 @@ def main():
     print("  demonstration : {} frames at {:.2f} Hz".format(
         demonstration.sample_count, demonstration.frequency_hz))
     print("  transforms    : {}".format(arguments.transform_count))
-    print("  translation   : +/- {:.3f} m".format(arguments.translation_m))
+    x_range = (arguments.x_min_m, arguments.x_max_m) if arguments.x_min_m is not None else None
+    y_range = (arguments.y_min_m, arguments.y_max_m) if arguments.y_min_m is not None else None
+    if x_range is None and y_range is None:
+        print("  translation   : +/- {:.3f} m".format(arguments.translation_m))
+    else:
+        print("  translation   : x {} y {} m".format(x_range, y_range))
     print("  yaw           : [{:+.1f}, {:+.1f}] deg  (asymmetric on purpose)".format(
         arguments.yaw_min_deg, arguments.yaw_max_deg))
     print("  device        : {}".format(device))
@@ -94,6 +103,8 @@ def main():
         position_tolerance_m=arguments.position_tolerance_m,
         rotation_tolerance_rad=arguments.rotation_tolerance_rad,
         limit_margin_rad=arguments.limit_margin_rad,
+        translation_x_range_m=x_range,
+        translation_y_range_m=y_range,
     )
     elapsed = time.time() - started
 

@@ -35,7 +35,19 @@ class SimToolRealCfg(BaseEnvCfg):
         # exact values the demonstration carries.
         rsi_velocity_noise_scale = 0.0
         rsi_pregrasp_start_index = 740 # proximity reward starts from this demonstration index
-        rsi_max_start_index = 830
+        rsi_max_start_index = 798
+        # Episodes starting at or after this demonstration index place the
+        # cuboid at the nearest bank entry's exact transform instead of the
+        # continuously sampled one. Late starts have the fingers on the bar,
+        # and the 16 mm median residual between the two put the bar inside
+        # the retargeted fingers: 25-45% of RSI 770-798 resets kicked it away
+        # under either contact model, 0% with the exact transform. Approach
+        # starts (before this index) keep the continuous placement. None
+        # disables the snap everywhere. 0 (2026-09-17): every episode starts
+        # on a bank entry; with banks/stage1_box.pt the entries are dense
+        # enough inside the training box (nearest neighbour ~2 mm median)
+        # that nothing is lost.
+        rsi_snap_placement_from_index = 0
 
     class domain_randomization:
         # Per-environment physical variation, sampled once at creation.
@@ -139,11 +151,23 @@ class SimToolRealCfg(BaseEnvCfg):
         # Converts yaw separation to an equivalent Cartesian distance for the
         # nearest-bank lookup: 10 degrees is about 1.75 cm at 0.1 m.
         nearest_yaw_lever_arm_m = 0.10
+        # Single-pose curriculum (fleet campaign, 2026-09-17): when this list
+        # is not empty every reset that does not name its transform draws the
+        # cuboid pose uniformly from these bank entries instead of the box
+        # above. Training, the periodic evaluator and the video roll-outs all
+        # go through that reset, so they see the same poses. Empty = the box.
+        fixed_transform_indices = []
         # Relative to the repository root. Built offline rather than at startup:
         # solving hundreds of clips takes minutes, and a transform must be
         # proven feasible over the clip's whole length before an episode is
         # allowed to start inside it.
-        bank_path = "banks/stage1.pt"
+        # banks/stage1_box.pt (2026-09-17): 1536 transforms sampled
+        # uniformly (seed 1) inside this very box (x +/-0.09, y 0..0.15, yaw
+        # -22.5..45), so every episode's placement is a bank entry (see
+        # env.rsi_snap_placement_from_index). The earlier banks/stage1.pt was
+        # built on +/-0.20 m and yaw up to 90 deg and had only ~50 entries
+        # inside the training box.
+        bank_path = "banks/stage1_box.pt"
 
     class asset:
         file = "assets/urdf/ur5e_delto_description/ur5e_right_dg5f_mount_60deg.urdf"
@@ -167,6 +191,26 @@ class SimToolRealCfg(BaseEnvCfg):
         # MuJoCo takes the maximum, so 1.0 here reproduces that effective
         # fingertip-cuboid friction (and the 0.5 of the other links).
         fingertip_friction = 1.0
+        # Newton/MJWarp only, and only with sim.mjwarp.contact_condim >= 4:
+        # torsional friction of the fingertip pads, the coefficient MuJoCo
+        # multiplies the normal force by to get the torque a contact resists
+        # about its normal [m]. None keeps MuJoCo's 0.005, which is what a
+        # rigid point contact gives; a soft pad flattened over the bar
+        # resists far more. The demonstration pinches the bar 4.5 cm from
+        # its centre, so without it the bar swings down about the pinch.
+        # 0.1 (2026-09-17, grasp lab, pinch of frame 798, 15 cm lift): the
+        # bar's rotation in the pinch drops from 50 to 11 deg and the slip
+        # from 40 to 12 mm; 0.05 gives 13 deg, 0.02 25 deg, 0.2 no better.
+        # Far above a physical pad (a 5 mm patch at mu 1 is ~0.003): it
+        # stands in for the deformable patch a rigid hull with one contact
+        # point cannot produce.
+        fingertip_torsional_friction = 0.1
+        # Same, for rolling friction (sim.mjwarp.contact_condim = 6): the
+        # torque a contact resists about axes tangent to the surface [m].
+        # This is what stops a bar pinched between a thumb and fingers that
+        # press at different heights from rolling about its long axis and
+        # swinging down; rigid point contacts have none, soft pads do.
+        fingertip_rolling_friction = None
         restitution = 0.0
 
     class object:
@@ -365,13 +409,32 @@ class SimToolRealCfg(BaseEnvCfg):
         # raises the damping ratio d/(2 sqrt(kJ)) at the same time.
         arm_stiffness_scale = 1.0
         arm_damping_scale = 1.0
-        hand_stiffness_scale = 1.0
+        # 0.116 puts the hand at 5 Nm/rad, the gain the simtoolreal_animrl
+        # sim2sim MuJoCo model runs the same policy with. MuJoCo's soft
+        # contacts need it: at the Isaac Gym gain (43 Nm/rad) the finger
+        # drives crush the bar out of the hand in 25-50% of placements, at
+        # 0.25 the demonstration's closure still kicks it in 25%, at 0.116
+        # it lifts the bar in 8/8 placements without kicking (see
+        # sim.mjwarp.contact_solref/contact_solimp/cone).
+        hand_stiffness_scale = 0.116
         hand_damping_scale = 1.0
         # Newton/MJWarp only. PhysX clamped joint speeds at the URDF limit
         # (3.14 rad/s); MuJoCo-Warp does not, so the environment slews the
         # position targets it applies at that limit instead (the commanded
         # target the policy sees is unchanged). False applies targets raw.
         slew_targets_at_velocity_limit = True
+        # First-order low-pass on the action the environment executes:
+        # a_f = alpha * a + (1 - alpha) * a_f_prev, applied after the action
+        # delay and before the twist/residual mapping, reset to the RSI action
+        # on reset. 1.0 executes the raw action. At 60 Hz, 0.3 puts the -3 dB
+        # point near 3.4 Hz; s2s_track5_quiet's policies ran a whole-body
+        # limit cycle at 3.5 Hz (every finger commanded +/-30 in phase with
+        # the wrist during the approach) that the action-rate rewards alone
+        # never broke, because the loop gain sat above 1 whatever they cost.
+        # The filter cuts that gain; the policy sees and is scored on its raw
+        # actions, so the action-rate terms keep their meaning. Any deployment
+        # must run the same filter on the same raw policy output.
+        action_filter_alpha = 1.0
 
     class contact:
         # Optional GPU contact shaping for the three fingers used by the

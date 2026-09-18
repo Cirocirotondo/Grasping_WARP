@@ -30,10 +30,14 @@ class BaseEnvCfg(ABCConfig):
         # Robot-specific exception to AnimRL's generic 5 ms / decimation 4:
         # one control step must match one sample of the 60 Hz demonstration.
         dt = 1.0 / 60.0
-        # Solver substeps per control step (240 Hz). Two substeps, the rate the
+        # Solver substeps per control step. Two substeps (120 Hz), the rate the
         # Isaac Gym configuration ran PhysX at, leave the light finger joints
-        # 0.1 rad short of their targets in MuJoCo-Warp; four converge.
-        substeps = 4
+        # 0.1 rad short of their targets in MuJoCo-Warp; four converge. Eight
+        # (480 Hz) are needed for the grasp itself: with four, replaying the
+        # demonstration's closure under the contact model below lifts the
+        # bar in 0/8 placements and kicks it in 38%; with eight, 8/8 and 0%.
+        # They cost 17% of training throughput (188k vs 227k fps, 4096 envs).
+        substeps = 8
         gravity = [0.0, 0.0, -9.81]
         device = "cuda:0"
         # Physics backend selected through Isaac Lab: "newton_mjwarp" (Newton
@@ -56,8 +60,21 @@ class BaseEnvCfg(ABCConfig):
             ls_iterations = 50
             solver = "newton"
             integrator = "implicitfast"
-            cone = "pyramidal"
-            impratio = 1.0
+            # Elliptic friction cones are what the grasp needs: with the
+            # pyramidal approximation the demonstration's closure never
+            # lifts the bar (0/8 placements above 8 cm, whatever the
+            # squeeze), with elliptic cones it does (8/8). Same choice as
+            # the validated simtoolreal_animrl sim2sim MuJoCo model. Costs
+            # about 8% of training throughput.
+            cone = "elliptic"
+            # Friction-to-normal impedance ratio. Together with the near-rigid
+            # contact_solimp below it is what stops a held bar from creeping
+            # out of the pinch: MuJoCo friction is a soft constraint, and at
+            # 1.0 a bar held by fingertip friction alone slid 1.4 mm/s and
+            # fell after 4 s; 10 gave 0.15 mm/s, 20 with the solimp below
+            # 0.01 mm/s (0.2 mm over 20 s). Measured 2026-09-17 in the grasp
+            # lab with the pinch of frame 798.
+            impratio = 20.0
             # Convex collision iterations; the multi-finger hand needs more
             # than MuJoCo's default of 35 to converge.
             ccd_iterations = 60
@@ -85,15 +102,31 @@ class BaseEnvCfg(ABCConfig):
             # Debugging only: run the reference CPU MuJoCo instead of MJWarp.
             use_mujoco_cpu = False
             # MuJoCo contact constraint softness (time constant [s], damping
-            # ratio) applied to every collider. None keeps MuJoCo's (0.02, 1),
-            # which let a light fingertip touch launch the resting cuboid at
-            # 0.3 m/s; 0.01 (the shortest the 240 Hz substep allows with
-            # margin) keeps the first touch quiet. Softer values (0.03, 0.05)
-            # kick again.
-            contact_solref = [0.01, 1.0]
+            # ratio) applied to every collider; None keeps MuJoCo's (0.02, 1).
+            # Over-damped 0.012 / 1.4 is the low-bounce contact of the
+            # simtoolreal_animrl sim2sim MuJoCo model, which this backend now
+            # mirrors (with contact_solimp, elliptic cones, 8 substeps and
+            # the 0.116 hand stiffness scale): replaying the demonstration's
+            # closure then lifts the bar in 8/8 placements without kicking
+            # it, and an extra 0.3 rad squeeze holds it 23 cm up to the end.
+            contact_solref = [0.012, 1.4]
+            # MuJoCo constraint impedance (d0, dmax, width, midpoint, power)
+            # applied to every collider; None keeps MuJoCo's (0.9, 0.95,
+            # 0.001, 0.5, 2). Nearly rigid, from the sim2sim model. The
+            # softer (0.3, 0.9, 0.02) tried first stopped the closure from
+            # kicking the bar but also removed the grip: fingers sank into a
+            # mushy contact, the bar slid out as if there were no friction
+            # and a policy trained on it learned to hover. d0/dwidth raised
+            # from 0.95/0.99 to 0.99/0.999 on 2026-09-17: with impratio 20
+            # it removes the last of the friction creep (see impratio).
+            contact_solimp = [0.99, 0.999, 0.002, 0.5, 2.0]
             # Contact friction dimensionality: 3 = sliding only, 4 adds
-            # torsional friction, 6 adds rolling friction.
-            contact_condim = 3
+            # torsional friction, 6 adds rolling friction. 4 is required for
+            # asset.fingertip_torsional_friction, the one parameter that lets
+            # an end pinch resist the bar's gravity moment (rotation in the
+            # pinch 50 deg -> 11 deg, slip 40 -> 12 mm during a 15 cm lift);
+            # 6 with rolling friction measured no better.
+            contact_condim = 4
 
         class physx:
             # Only used with the PhysX backends. Values mirror the original
@@ -156,6 +189,12 @@ class BaseTrainCfg(ABCConfig):
         # Keep exploration bounded. The learned parameter is log(sigma), while
         # this setting is expressed directly in action-standard-deviation units.
         max_action_std = 3.0
+        # Floor on the same units, None for no floor. With entropy_coef 0 the
+        # learned sigma only ever shrinks (0.44 -> 0.32 over the track6/7
+        # runs) and both runs started regressing once it passed ~0.35:
+        # exploration dies before the policy is done. A floor keeps it alive
+        # without the runaway inflation entropy_coef 0.001 produced (1.7).
+        min_action_std = None
         actor_hidden_dims = [512, 256]
         critic_hidden_dims = [512, 256]
         activation = "elu"

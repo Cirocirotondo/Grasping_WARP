@@ -370,6 +370,8 @@ def build_transform_bank(
     rotation_tolerance_rad: float = 1e-2,
     limit_margin_rad: float = 0.05,
     velocity_fraction: float = 0.5,
+    translation_x_range_m=None,
+    translation_y_range_m=None,
     control_dt: Optional[float] = None,
     verbose: bool = True,
 ) -> TransformBank:
@@ -421,10 +423,18 @@ def build_transform_bank(
             + yaw_low_rad
         ).to(dtype=dtype, device=device)
         translation = torch.zeros(size, 3, dtype=dtype, device=device)
-        translation[:, :2] = (
-            (torch.rand(size, 2, generator=generator, dtype=torch.float64) * 2.0 - 1.0)
-            * float(translation_m)
-        ).to(dtype=dtype, device=device)
+        unit = torch.rand(size, 2, generator=generator, dtype=torch.float64)
+        if translation_x_range_m is None and translation_y_range_m is None:
+            planar = (unit * 2.0 - 1.0) * float(translation_m)
+        else:
+            # An explicit box, e.g. the training's object_randomization range,
+            # which is not symmetric in y. Continuous uniform, no grid.
+            x_range = translation_x_range_m if translation_x_range_m is not None else (-translation_m, translation_m)
+            y_range = translation_y_range_m if translation_y_range_m is not None else (-translation_m, translation_m)
+            low = torch.tensor([float(x_range[0]), float(y_range[0])], dtype=torch.float64)
+            high = torch.tensor([float(x_range[1]), float(y_range[1])], dtype=torch.float64)
+            planar = unit * (high - low) + low
+        translation[:, :2] = planar.to(dtype=dtype, device=device)
 
         # The training bank intentionally preserves the demonstrated joint
         # family. An alternative elbow/wrist branch may reach the same palm
@@ -476,7 +486,18 @@ def build_transform_bank(
     translation = torch.cat([item[1] for item in collected])[:transform_count]
     arm_q = torch.cat([item[2] for item in collected], dim=1)[:, :transform_count, :]
 
-    arm_dq = map_arm_velocities(kinematics, demo_arm_q, demo_arm_dq, arm_q, yaw)
+    # Chunked like the feasibility loop above: the Jacobian of every frame of
+    # every transform at once (1108 x 1536 configurations) needs more GPU
+    # memory than the sampling itself and ran out at 1536 transforms.
+    arm_dq = torch.cat(
+        [
+            map_arm_velocities(
+                kinematics, demo_arm_q, demo_arm_dq, arm_q[:, start : start + batch], yaw[start : start + batch]
+            )
+            for start in range(0, transform_count, batch)
+        ],
+        dim=1,
+    )
     frames = demo_q.shape[0]
     hand_q = demo_q[:, None, ARM_JOINT_COUNT:].expand(
         frames, transform_count, demo_q.shape[1] - ARM_JOINT_COUNT

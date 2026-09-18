@@ -190,6 +190,29 @@ class RunnerModulesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Policy(num_obs=4, num_actions=2, max_action_std=0.0)
 
+    def test_policy_floors_and_projects_action_standard_deviation(self):
+        """With entropy_coef 0 the learned sigma only shrinks; the floor
+        keeps exploration alive the way the cap keeps it bounded."""
+        policy = Policy(
+            num_obs=4,
+            num_actions=2,
+            hidden_dims=[8, 8],
+            max_action_std=0.5,
+            min_action_std=0.25,
+        )
+        with torch.no_grad():
+            policy.log_std.fill_(math.log(0.05))
+
+        policy.act_and_log_prob(torch.zeros(3, 4))
+        self.assertTrue(torch.allclose(policy.action_std, torch.full((3, 2), 0.25)))
+
+        policy.project_action_std()
+        self.assertTrue(torch.all(policy.log_std >= math.log(0.25) - 1.0e-7))
+
+    def test_policy_rejects_a_floor_above_the_cap(self):
+        with self.assertRaises(ValueError):
+            Policy(num_obs=4, num_actions=2, max_action_std=0.5, min_action_std=0.6)
+
     def test_normalizer_and_rollout_shapes(self):
         normalizer = EmpiricalNormalization(19)
         normalized = normalizer(torch.randn(16, 19))
@@ -263,7 +286,7 @@ class RunnerModulesTest(unittest.TestCase):
     def test_default_rsi_uses_the_pregrasp_mixture(self):
         """Most resets practise the difficult closure while some start early."""
         settings = resolve_rsi_settings(self.env_cfg.env, 1107)
-        self.assertEqual(settings, ("pregrasp_mixture", 830, 740, 0.20))
+        self.assertEqual(settings, ("pregrasp_mixture", 798, 740, 0.20))
         generator = torch.Generator(device="cpu")
         generator.manual_seed(123)
         indices = sample_rsi_indices(

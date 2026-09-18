@@ -64,7 +64,35 @@ SCALAR_INFO_KEYS: Tuple[str, ...] = (
     "fingertip_contact_fraction",
     "mean_fingertip_contact_force_n",
     "proximity_active",
+    "palm_keypoint_error_m",
+    "fingertip_keypoint_error_m",
+    "palm_keypoint_reward",
+    "fingertip_keypoint_reward",
 )
+
+# Pose axes, in the order the palm and object pose tracking figures draw them.
+POSE_POSITION_NAMES: Tuple[str, ...] = ("x", "y", "z")
+POSE_ROTATION_NAMES: Tuple[str, ...] = ("roll", "pitch", "yaw")
+
+
+def _matrix_to_rpy(matrix: np.ndarray) -> np.ndarray:
+    """``(N, 3, 3)`` rotation matrices to ``(N, 3)`` ZYX Euler angles (roll, pitch, yaw) [rad].
+
+    Yaw about z, then pitch about y, then roll about x -- the intrinsic
+    convention hardware tooling reports palm attitude in. NaN rows stay NaN.
+    """
+    matrix = np.asarray(matrix, dtype=np.float64)
+    pitch = -np.arcsin(np.clip(matrix[:, 2, 0], -1.0, 1.0))
+    roll = np.arctan2(matrix[:, 2, 1], matrix[:, 2, 2])
+    yaw = np.arctan2(matrix[:, 1, 0], matrix[:, 0, 0])
+    return np.stack((roll, pitch, yaw), axis=1)
+
+
+def _rotation_angle(matrix_a: np.ndarray, matrix_b: np.ndarray) -> np.ndarray:
+    """Geodesic angle [rad] between two ``(N, 3, 3)`` rotation batches."""
+    relative = np.einsum("nji,njk->nik", matrix_a, matrix_b)
+    trace = relative[:, 0, 0] + relative[:, 1, 1] + relative[:, 2, 2]
+    return np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
 
 
 def _use_agg():
@@ -150,6 +178,8 @@ class EvaluationPlotter:
         self._weights: Dict[str, float] = {}
         self._position_threshold: Optional[float] = None
         self._hand_position_threshold: Optional[float] = None
+        self._palm_keypoint_threshold: Optional[float] = None
+        self._object_position_threshold: Optional[float] = None
         self._reference_initial_object_com_height_m = 0.0
         self._hand_action_scale = 1.0
         self._num_arm_dofs = 0
@@ -200,6 +230,16 @@ class EvaluationPlotter:
         self._position_threshold = None
         self._hand_position_threshold = (
             float(env.cfg.termination.hand_position_threshold_rad)
+            if enabled
+            else None
+        )
+        self._palm_keypoint_threshold = (
+            float(env.cfg.termination.palm_keypoint_threshold_m)
+            if enabled
+            else None
+        )
+        self._object_position_threshold = (
+            float(env.cfg.termination.object_position_threshold_m)
             if enabled
             else None
         )
@@ -290,6 +330,14 @@ class EvaluationPlotter:
         self._append("reference_hand_q", _vector(reference.q[:, arm:], 0))
         self._append("reference_hand_dq", _vector(reference.dq[:, arm:], 0))
 
+        # Palm and object pose against the reference each is scored on. The
+        # reference is read for this env's own reference index (advanced by
+        # step(), like the joint reference above). Both sides are NaN on a
+        # done step: the env has already reset, so the measured pose is the
+        # next episode's and so is the reference index.
+        self._record_pose("palm", env.palm_pose_tracking(), done)
+        self._record_pose("object", env.object_pose_tracking(), done)
+
         if done:
             nan_arm = np.full(arm, np.nan)
             nan_hand = np.full(self._num_hand_dofs, np.nan)
@@ -302,6 +350,25 @@ class EvaluationPlotter:
             self._append("actual_arm_dq", _vector(env.arm_dq, env_idx))
             self._append("actual_hand_q", _vector(env.hand_q, env_idx))
             self._append("actual_hand_dq", _vector(env.hand_dq, env_idx))
+
+    def _record_pose(self, name: str, pose: Dict[str, Any], done: bool) -> None:
+        """Append one frame's reference and actual pose for `name` (palm/object)."""
+        env_idx = self.env_idx
+        for side in ("reference", "actual"):
+            if done:
+                self._append("{}_{}_position".format(side, name), np.full(3, np.nan))
+                self._append("{}_{}_matrix".format(side, name), np.full((3, 3), np.nan))
+            else:
+                self._append(
+                    "{}_{}_position".format(side, name),
+                    _vector(pose[side + "_position"], env_idx),
+                )
+                self._append(
+                    "{}_{}_matrix".format(side, name),
+                    np.asarray(
+                        pose[side + "_matrix"][env_idx].detach().cpu(), dtype=np.float64
+                    ),
+                )
 
     def _arrays(self) -> Dict[str, np.ndarray]:
         arrays = {
@@ -328,6 +395,32 @@ class EvaluationPlotter:
         arrays["arm_velocity_error"] = (
             arrays["actual_arm_dq"] - arrays["reference_arm_dq"]
         )
+        for name in ("palm", "object"):
+            if "actual_{}_matrix".format(name) not in arrays:
+                continue
+            reference_matrix = arrays["reference_{}_matrix".format(name)]
+            actual_matrix = arrays["actual_{}_matrix".format(name)]
+            # Euler angles are unwrapped per series so a yaw crossing +/-pi
+            # does not draw as a jump; the rotation error is the geodesic
+            # angle, which needs no convention at all.
+            reference_rpy = _matrix_to_rpy(reference_matrix)
+            finite = np.all(np.isfinite(reference_rpy), axis=1)
+            if finite.any():
+                reference_rpy[finite] = np.unwrap(reference_rpy[finite], axis=0)
+            arrays["reference_{}_rpy".format(name)] = reference_rpy
+            # The measured angles are drawn on the reference's branch: wrap
+            # the difference into [-pi, pi) and add it back, so both curves
+            # share one continuous scale instead of sitting 2*pi apart.
+            difference = _matrix_to_rpy(actual_matrix) - reference_rpy
+            difference = (difference + np.pi) % (2.0 * np.pi) - np.pi
+            arrays["actual_{}_rpy".format(name)] = reference_rpy + difference
+            arrays["{}_position_error".format(name)] = (
+                arrays["actual_{}_position".format(name)]
+                - arrays["reference_{}_position".format(name)]
+            )
+            arrays["{}_rotation_error_rad".format(name)] = _rotation_angle(
+                actual_matrix, reference_matrix
+            )
         # a_t - a_{t-1}, the quantity the action-rate reward term regularizes.
         # The first entry has no predecessor inside the recorded window.
         action_delta = np.diff(arrays["action"], axis=0)
@@ -390,6 +483,8 @@ class EvaluationPlotter:
         paths.update(self._save_object_height(plt, episode_dir, arrays))
         paths.update(self._save_fingertip_forces(plt, episode_dir, arrays))
         paths.update(self._save_fingertip_proximity(plt, episode_dir, arrays))
+        paths.update(self._save_palm_pose_tracking(plt, episode_dir, arrays))
+        paths.update(self._save_object_pose_tracking(plt, episode_dir, arrays))
         paths.update(self._save_joint_tracking(plt, episode_dir, arrays, "arm"))
         paths.update(self._save_joint_tracking(plt, episode_dir, arrays, "hand"))
         paths.update(self._save_action_per_joint(plt, episode_dir, arrays, "arm"))
@@ -830,6 +925,95 @@ class EvaluationPlotter:
         fig.savefig(path, dpi=150)
         plt.close(fig)
         return {"fingertip_proximity_png": str(path)}
+
+    def _save_palm_pose_tracking(self, plt, episode_dir, data) -> Dict[str, str]:
+        """Palm position and attitude against the reference, axis by axis.
+
+        Left column: x, y, z of the palm origin in the env frame. Right column:
+        roll, pitch, yaw. Bottom row: the position error per axis beside the
+        palm keypoint RMS the reward and termination use, and the geodesic
+        rotation error beside the termination threshold when there is one.
+        """
+        return self._save_pose_tracking(
+            plt, episode_dir, data, "palm",
+            position_extra=("palm_keypoint_error_m", "keypoint RMS (reward/termination)"),
+            position_threshold=self._palm_keypoint_threshold,
+            rotation_extra=("palm_tilt_error_rad", "tilt error"),
+        )
+
+    def _save_object_pose_tracking(self, plt, episode_dir, data) -> Dict[str, str]:
+        """Object (bar) position and attitude against the reference, same layout
+        as the palm figure.
+
+        Bottom row: the position error per axis beside the norm the object
+        position reward and termination use (with the termination threshold
+        when there is one), and the geodesic rotation error beside the
+        orientation error the reward reports.
+        """
+        return self._save_pose_tracking(
+            plt, episode_dir, data, "object",
+            position_extra=("object_position_error_m", "|error| (reward/termination)"),
+            position_threshold=self._object_position_threshold,
+            rotation_extra=("object_orientation_error_rad", "orientation error (reward)"),
+        )
+
+    def _save_pose_tracking(
+        self, plt, episode_dir, data, name,
+        *, position_extra, position_threshold, rotation_extra,
+    ) -> Dict[str, str]:
+        """Shared 4x2 pose figure: x/y/z left, roll/pitch/yaw right, errors below."""
+        if "actual_{}_rpy".format(name) not in data:
+            return {}
+        time_s = data["time_s"]
+        reference_position = data["reference_{}_position".format(name)]
+        actual_position = data["actual_{}_position".format(name)]
+        reference_rpy = data["reference_{}_rpy".format(name)]
+        actual_rpy = data["actual_{}_rpy".format(name)]
+        position_error = data["{}_position_error".format(name)]
+        rotation_error = data["{}_rotation_error_rad".format(name)]
+
+        fig, axes = plt.subplots(4, 2, figsize=(16, 15), sharex=True)
+        for row, axis in enumerate(POSE_POSITION_NAMES):
+            ax = axes[row, 0]
+            ax.plot(time_s, reference_position[:, row], label="target", color="tab:green")
+            ax.plot(time_s, actual_position[:, row], label="actual", color="tab:red", linestyle="--")
+            _finish_axis(ax, "{} {} [m]".format(name, axis))
+        for row, axis in enumerate(POSE_ROTATION_NAMES):
+            ax = axes[row, 1]
+            ax.plot(time_s, reference_rpy[:, row], label="target", color="tab:green")
+            ax.plot(time_s, actual_rpy[:, row], label="actual", color="tab:red", linestyle="--")
+            _finish_axis(ax, "{} {} [rad]".format(name, axis))
+
+        ax = axes[3, 0]
+        colors = _joint_colors(3)
+        for column, axis in enumerate(POSE_POSITION_NAMES):
+            ax.plot(time_s, position_error[:, column], label="error " + axis, color=colors[column])
+        ax.plot(
+            time_s, np.linalg.norm(position_error, axis=1),
+            label="|error|", color="black", linewidth=1.2,
+        )
+        extra_key, extra_label = position_extra
+        if extra_key in data:
+            ax.plot(time_s, data[extra_key], label=extra_label, color="tab:purple", linestyle=":")
+        if position_threshold is not None:
+            ax.axhline(position_threshold, color="red", linestyle="--", linewidth=0.9)
+        _finish_axis(ax, "Position error [m]")
+        ax.set_xlabel("Episode time [s]")
+
+        ax = axes[3, 1]
+        ax.plot(time_s, rotation_error, label="rotation error (geodesic)", color="black")
+        extra_key, extra_label = rotation_extra
+        if extra_key in data:
+            ax.plot(time_s, data[extra_key], label=extra_label, color="tab:purple", linestyle=":")
+        _finish_axis(ax, "Rotation error [rad]")
+        ax.set_xlabel("Episode time [s]")
+
+        fig.suptitle("{} pose tracking — {}".format(name.capitalize(), self._slug))
+        fig.tight_layout()
+        path = episode_dir / "{}_pose_tracking.png".format(name)
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        return {"{}_pose_tracking_png".format(name): str(path)}
 
     def _save_joint_tracking(self, plt, episode_dir, data, group) -> Dict[str, str]:
         """One tracking figure per joint block; 26 joints in one is unreadable."""

@@ -11,3 +11,7 @@ assets/usd/
 assets/ur5e_right_dg5f.urdf
 # Large offline artefacts
 banks/*.bak*
+# Transform banks are hundreds of MB; rebuild with scripts/build_transform_bank.py
+banks/*.pt
+# Claude Code session state
+.claude/

@@ -95,6 +95,7 @@ from simtoolreal_newton.envs.rotations import (
     quat_multiply as _quat_multiply,
     quat_rotate as _quat_rotate,
     quat_rotate_inverse as _quat_rotate_inverse,
+    quat_to_matrix as _quat_to_matrix,
     quat_to_rotation_6d,
 )
 from simtoolreal_newton.envs.rsi import resolve_rsi_settings, sample_rsi_indices
@@ -183,6 +184,8 @@ class MotionImitationEnv(DirectRLEnv):
             self.rsi_pregrasp_start_index,
             self.rsi_early_probability,
         ) = resolve_rsi_settings(acfg.env, self.reference.last_index)
+        snap_from = getattr(acfg.env, "rsi_snap_placement_from_index", None)
+        self.rsi_snap_placement_from_index = None if snap_from is None else int(snap_from)
         self.object_assist_settings = resolve_object_assist_settings(acfg.object_assist, self.reference.last_index)
         self.object_assist_enabled = self.object_assist_settings.enabled
         self.object_assist_gates_object_reward = bool(getattr(acfg.object_assist, "gate_object_reward", True))
@@ -372,7 +375,12 @@ class MotionImitationEnv(DirectRLEnv):
         table_prim = "/World/envs/env_0/Table"
         self.cfg.table.func(table_prim, self.cfg.table, translation=tuple(self.cfg.table_pos))
         self._author_collision_filters(table_prim)
-        self._bind_fingertip_material(float(acfg.asset.fingertip_friction), float(acfg.asset.restitution))
+        self._bind_fingertip_material(
+            float(acfg.asset.fingertip_friction),
+            float(acfg.asset.restitution),
+            getattr(acfg.asset, "fingertip_torsional_friction", None),
+            getattr(acfg.asset, "fingertip_rolling_friction", None),
+        )
         self.contact_sensor = None
         if self.cfg.contact_sensor is not None:
             self.contact_sensor = ContactSensor(self.cfg.contact_sensor)
@@ -453,14 +461,39 @@ class MotionImitationEnv(DirectRLEnv):
         self.arm_collision_body_names = tuple(n for n in bodies if n in ARM_BODY_NAMES)
         self.hand_collision_body_names = tuple(n for n in bodies if n not in ARM_BODY_NAMES)
 
-    def _bind_fingertip_material(self, friction: float, restitution: float) -> None:
+    def _bind_fingertip_material(
+        self, friction: float, restitution: float, torsional_friction=None, rolling_friction=None
+    ) -> None:
         """Give the five distal phalanges their own, grippier, physics material."""
         stage, bodies = self._robot_body_prims()
         material_path = "/World/envs/env_0/Robot/fingertip_material"
         material_cfg = RigidBodyMaterialBaseCfg(
             static_friction=friction, dynamic_friction=friction, restitution=restitution
         )
-        material_cfg.func(material_path, material_cfg)
+        if torsional_friction is None and rolling_friction is None:
+            material_cfg.func(material_path, material_cfg)
+        else:
+            # Newton-only fragment (newton:torsionalFriction) composed with the
+            # solver-common friction/restitution on the same material prim.
+            from isaaclab.sim.spawners.materials import (
+                UsdPhysicsRigidBodyMaterialCfg,
+                spawn_rigid_body_material_from_fragments,
+            )
+            from isaaclab_newton.sim.spawners.materials import NewtonMaterialCfg
+
+            spawn_rigid_body_material_from_fragments(
+                material_path,
+                [
+                    UsdPhysicsRigidBodyMaterialCfg(
+                        static_friction=friction, dynamic_friction=friction, restitution=restitution
+                    ),
+                    NewtonMaterialCfg(
+                        torsional_friction=None if torsional_friction is None else float(torsional_friction),
+                        rolling_friction=None if rolling_friction is None else float(rolling_friction),
+                    ),
+                ],
+                stage=stage,
+            )
         for name in FINGERTIP_BODY_NAMES:
             prim = bodies.get(name)
             if prim is None:
@@ -585,6 +618,12 @@ class MotionImitationEnv(DirectRLEnv):
         self.object_assist_torque_nm = torch.zeros_like(self.object_assist_force_n)
         self.actions = torch.zeros((n, self.num_actions), dtype=torch.float32, device=device)
         self.previous_actions = torch.zeros_like(self.actions)
+        # The low-passed action the environment executes (see
+        # control.action_filter_alpha); equals the raw action at alpha 1.
+        self.action_filter_alpha = float(getattr(self.animrl_cfg.control, "action_filter_alpha", 1.0))
+        if not 0.0 < self.action_filter_alpha <= 1.0:
+            raise ValueError("control.action_filter_alpha must lie in (0, 1]")
+        self.filtered_actions = torch.zeros_like(self.actions)
         self.position_targets = torch.zeros((n, self.num_actions), dtype=torch.float32, device=device)
         # What the drives are actually fed: the commanded targets, slewed at
         # the URDF joint velocity limits (see _apply_action).
@@ -800,6 +839,52 @@ class MotionImitationEnv(DirectRLEnv):
             _quat_multiply(wrist_orientation, self.palm_orientation_in_wrist)
         )
         return palm_position, palm_orientation
+
+    def palm_pose_tracking(self) -> Dict[str, torch.Tensor]:
+        """Actual and reference palm pose in the env frame, for evaluation plots.
+
+        The reference palm is rebuilt from the transform bank's palm keypoints
+        (origin plus three lever points in the reference bar frame) and placed
+        in the env frame through the episode's reference bar pose -- the same
+        anchoring the palm keypoint reward uses with anchor="reference", so
+        the plotted target is exactly what the policy is scored against.
+        Rotations are ``(N, 3, 3)`` matrices whose columns are the palm axes.
+        """
+        actual_position, actual_orientation = self._palm_pose_world()
+        reference = self.transform_bank.sample(self.transform_index, self.reference_index)
+        root = self._cube_reference_root_states(reference)
+        root_orientation = _normalize_canonical_quaternion(root[:, 3:7])
+        keypoints = self.transform_bank.keypoints_at(self.reference_index)
+        origin = keypoints[:, 0]
+        # hand_keypoints() puts the image of basis vector i at index i + 1, so
+        # the differences are the columns of the palm rotation in the bar frame.
+        axes_in_bar = (keypoints[:, 1:4] - origin.unsqueeze(1)) / float(self.palm_lever_arm_m)
+        matrix_in_bar = axes_in_bar.transpose(1, 2)
+        return {
+            "actual_position": actual_position,
+            "actual_matrix": _quat_to_matrix(actual_orientation),
+            "reference_position": root[:, 0:3] + _quat_rotate(root_orientation, origin),
+            "reference_matrix": _quat_to_matrix(root_orientation) @ matrix_in_bar,
+        }
+
+    def object_pose_tracking(self) -> Dict[str, torch.Tensor]:
+        """Actual and reference object pose in the env frame, for evaluation plots.
+
+        The reference is the episode's transformed demonstration bar pose --
+        the same root state the object position and orientation rewards and
+        the object termination compare against. Rotations are ``(N, 3, 3)``
+        matrices whose columns are the bar axes.
+        """
+        reference = self.transform_bank.sample(self.transform_index, self.reference_index)
+        root = self._cube_reference_root_states(reference)
+        root_orientation = _normalize_canonical_quaternion(root[:, 3:7])
+        actual_orientation = _normalize_canonical_quaternion(self.cube_orientation)
+        return {
+            "actual_position": self.cube_position,
+            "actual_matrix": _quat_to_matrix(actual_orientation),
+            "reference_position": root[:, 0:3],
+            "reference_matrix": _quat_to_matrix(root_orientation),
+        }
 
     def _palm_jacobian_arm(self) -> torch.Tensor:
         """``(num_envs, 6, 6)`` base/world-frame palm Jacobian over the six arm DOFs.
@@ -1111,8 +1196,14 @@ class MotionImitationEnv(DirectRLEnv):
         if env_ids.numel() == 0:
             return
         count = env_ids.numel()
+        randomization = self.animrl_cfg.object_randomization
+        fixed_indices = list(getattr(randomization, "fixed_transform_indices", []) or [])
+        if transform_indices is None and episode_translation is None and fixed_indices:
+            # Single-pose curriculum: the pose comes from the named bank
+            # entries only (uniformly when there are several).
+            choices = torch.as_tensor(fixed_indices, device=self.device, dtype=torch.long)
+            transform_indices = choices[torch.randint(len(fixed_indices), (count,), device=self.device)]
         if transform_indices is None:
-            randomization = self.animrl_cfg.object_randomization
             if (episode_translation is None) != (episode_yaw_rad is None):
                 raise ValueError("episode_translation and episode_yaw_rad must be given together")
             if episode_translation is None:
@@ -1177,6 +1268,19 @@ class MotionImitationEnv(DirectRLEnv):
             if torch.any(reference_indices < 0) or torch.any(reference_indices > max_start):
                 raise ValueError("RSI indices must lie in [0, {}]".format(max_start))
 
+        # Episodes that start with the fingers already on the bar cannot
+        # tolerate the continuous-vs-bank placement residual (median 16 mm):
+        # the cuboid would be placed inside the retargeted fingers and the
+        # contact solver fires it away (25-45% of placements at RSI 770-798,
+        # measured with both contact models; 0% with the bank's own
+        # transform). Those episodes use the bank entry's exact transform.
+        if self.rsi_snap_placement_from_index is not None:
+            snap = reference_indices >= int(self.rsi_snap_placement_from_index)
+            if bool(snap.any()):
+                snapped = env_ids[snap]
+                self.episode_translation[snapped] = self.transform_bank.translation[transform_indices[snap]]
+                self.episode_yaw_rad[snapped] = self.transform_bank.yaw_rad[transform_indices[snap]]
+
         # Isaac Lab bookkeeping: asset buffers, event manager, episode counter.
         DirectRLEnv._reset_idx(self, env_ids.to(torch.int32))
 
@@ -1205,6 +1309,7 @@ class MotionImitationEnv(DirectRLEnv):
         reset_action[:, len(ARM_JOINT_NAMES) :] = self.positions_to_hand_actions(reset_q[:, len(ARM_JOINT_NAMES) :])
         self.actions[env_ids] = reset_action
         self.previous_actions[env_ids] = reset_action
+        self.filtered_actions[env_ids] = reset_action
         self.suppress_ee_action_rate[env_ids] = True
         self.action_delay.reset(env_ids, reset_action)
         self.requested_twist[env_ids] = 0.0
@@ -1297,6 +1402,9 @@ class MotionImitationEnv(DirectRLEnv):
                 dim=1,
             )
         )
+        # Last line of defence against a blown-up world: the env is being
+        # terminated (see _get_dones), and the policy must never see NaN.
+        torch.nan_to_num_(self.policy_obs, nan=0.0, posinf=0.0, neginf=0.0)
         if self.critic_obs is not None:
             parts = [self.policy_obs]
             if self.critic_force_observation_dim:
@@ -1306,6 +1414,7 @@ class MotionImitationEnv(DirectRLEnv):
             if self.critic_parameter_table is not None:
                 parts.append(self.critic_parameter_table)
             self.critic_obs.copy_(torch.cat(parts, dim=1))
+            torch.nan_to_num_(self.critic_obs, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _observation_dict(self) -> dict:
         observations = {"policy": self.policy_obs}
@@ -1613,7 +1722,12 @@ class MotionImitationEnv(DirectRLEnv):
             )
         self.previous_actions.copy_(self.actions)
         self.actions.copy_(actions.to(device=self.device, dtype=torch.float32))
-        complete_target_q = self.command_targets(self.action_delay(self.actions))
+        delayed = self.action_delay(self.actions)
+        if self.action_filter_alpha < 1.0:
+            self.filtered_actions.lerp_(delayed, self.action_filter_alpha)
+        else:
+            self.filtered_actions.copy_(delayed)
+        complete_target_q = self.command_targets(self.filtered_actions)
         self.position_targets.copy_(complete_target_q)
         if self.object_assist_enabled or self.domain_randomization.impulses_enabled:
             self.cube_body_forces.zero_()
@@ -1672,6 +1786,32 @@ class MotionImitationEnv(DirectRLEnv):
         _, early, timeout = self._compute_termination(
             metrics["palm_keypoint_error_m"], metrics["hand_q_error"], metrics["object_position_error_m"]
         )
+        # A contact blow-up leaves NaN in one world's state. Left alone it
+        # reaches the policy as a NaN observation and kills the run (twice in
+        # this lineage: s2s_track3_palm08 at 14014, s2s_track5_quiet at
+        # 17898). Terminate and reset that env instead; its reward and
+        # observation are zeroed below so nothing non-finite is learned from.
+        blown = ~(
+            torch.isfinite(self.q).all(dim=1)
+            & torch.isfinite(self.dq).all(dim=1)
+            & torch.isfinite(self.cube_root_state).all(dim=1)
+        )
+        self.sim_blowup = blown
+        if bool(blown.any()):
+            early = early | blown
+            # The metrics of a blown env were accumulated above with NaN in
+            # them, and one NaN in the episode sums makes the whole
+            # iteration's mean return NaN in the log and in TensorBoard.
+            # Drop that env's partial episode from the statistics.
+            for values in self.episode_sums.values():
+                values[blown] = 0.0
+            self.episode_peak_object_com_height_m[blown] = self.episode_initial_object_com_height_m[blown]
+            print(
+                "[env] {} env(s) with non-finite state at reference index {}; resetting them".format(
+                    int(blown.sum()), int(self.reference_index[blown][0])
+                ),
+                flush=True,
+            )
         self._metrics = metrics
         self._early = early
         self._timeout = timeout
@@ -1749,6 +1889,9 @@ class MotionImitationEnv(DirectRLEnv):
                 "Episode/mean_peak_object_com_lift_m": summary["mean_peak_object_com_lift_m"],
             }
         self.extras = extras
+        # Non-finite state (see _get_dones) makes every term NaN; zero it so
+        # the value target stays finite for the env being reset.
+        torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)
         return self.rew_buf.clone()
 
     # ------------------------------------------------------------------

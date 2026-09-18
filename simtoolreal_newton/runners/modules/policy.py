@@ -36,6 +36,7 @@ class Policy(nn.Module):
         activation="elu",
         log_std_init=0.0,
         max_action_std=None,
+        min_action_std=None,
         device="cpu",
         **kwargs
     ):
@@ -57,9 +58,11 @@ class Policy(nn.Module):
         self.policy_latent_net = nn.Sequential(*layers)
 
         self.max_action_std = max_action_std
+        self.min_action_std = min_action_std
         self.distribution = DiagGaussianDistribution(
             action_dim=num_actions,
             max_action_std=max_action_std,
+            min_action_std=min_action_std,
         )
         self.action_mean_net, self.log_std = self.distribution.proba_distribution_net(
             latent_dim=hidden_dims[-1], log_std_init=log_std_init
@@ -86,11 +89,14 @@ class Policy(nn.Module):
         return self.distribution.entropy()
 
     def project_action_std(self):
-        """Project the learned log standard deviation onto its configured cap."""
-        if self.max_action_std is None:
+        """Project the learned log standard deviation onto its configured bounds."""
+        if self.max_action_std is None and self.min_action_std is None:
             return
         with torch.no_grad():
-            self.log_std.clamp_(max=math.log(self.max_action_std))
+            self.log_std.clamp_(
+                min=math.log(self.min_action_std) if self.min_action_std is not None else None,
+                max=math.log(self.max_action_std) if self.max_action_std is not None else None,
+            )
 
     def act_and_log_prob(self, observations):
         mean = self.action_mean_net(self.policy_latent_net(observations))

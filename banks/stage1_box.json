@@ -1,0 +1,20 @@
+{
+  "batch": 256,
+  "demo": "/home/simone/simtoolreal_newton/demonstrations/demo_20260727_152551_335339_60hz_cube_collision_resolved_stable_grasp.npz",
+  "device": "cuda",
+  "lever_arm_m": 0.1,
+  "limit_margin_rad": 0.05,
+  "output": "banks/stage1_box.pt",
+  "position_tolerance_m": 0.001,
+  "rotation_tolerance_rad": 0.01,
+  "seed": 1,
+  "transform_count": 1536,
+  "translation_m": 0.2,
+  "urdf": "/home/simone/simtoolreal_newton/assets/urdf/ur5e_delto_description/ur5e_right_dg5f_mount_60deg.urdf",
+  "x_max_m": 0.09,
+  "x_min_m": -0.09,
+  "y_max_m": 0.15,
+  "y_min_m": 0.0,
+  "yaw_max_deg": 45.0,
+  "yaw_min_deg": -22.5
+}

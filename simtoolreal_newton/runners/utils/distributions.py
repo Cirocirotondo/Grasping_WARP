@@ -59,14 +59,31 @@ def sum_independent_dims(tensor: torch.Tensor) -> torch.Tensor:
 class DiagGaussianDistribution(Distribution):
     """Unsquashed diagonal Gaussian used by the original AnimRL PPO."""
 
-    def __init__(self, action_dim: int, max_action_std: Optional[float] = None):
+    def __init__(
+        self,
+        action_dim: int,
+        max_action_std: Optional[float] = None,
+        min_action_std: Optional[float] = None,
+    ):
         super().__init__()
         self.action_dim = action_dim
         if max_action_std is not None and max_action_std <= 0.0:
             raise ValueError("max_action_std must be positive or None")
+        if min_action_std is not None and min_action_std <= 0.0:
+            raise ValueError("min_action_std must be positive or None")
+        if (
+            max_action_std is not None
+            and min_action_std is not None
+            and min_action_std > max_action_std
+        ):
+            raise ValueError("min_action_std must not exceed max_action_std")
         self.max_action_std = max_action_std
+        self.min_action_std = min_action_std
         self.max_log_std = (
             math.log(max_action_std) if max_action_std is not None else None
+        )
+        self.min_log_std = (
+            math.log(min_action_std) if min_action_std is not None else None
         )
         self.mean_actions = None
         self.log_std = None
@@ -82,8 +99,10 @@ class DiagGaussianDistribution(Distribution):
         self, mean_actions: torch.Tensor, log_std: torch.Tensor
     ):
         effective_log_std = log_std
-        if self.max_log_std is not None:
-            effective_log_std = torch.clamp(log_std, max=self.max_log_std)
+        if self.max_log_std is not None or self.min_log_std is not None:
+            effective_log_std = torch.clamp(
+                log_std, min=self.min_log_std, max=self.max_log_std
+            )
         action_std = torch.ones_like(mean_actions) * effective_log_std.exp()
         self.distribution = Normal(mean_actions, action_std)
         return self

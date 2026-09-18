@@ -124,6 +124,7 @@ class PPO:
             activation=self.policy_cfg.activation,
             log_std_init=self.policy_cfg.log_std_init,
             max_action_std=self.policy_cfg.max_action_std,
+            min_action_std=getattr(self.policy_cfg, "min_action_std", None),
             device=self.device,
         ).to(self.device)
         self.value = Value(
@@ -950,6 +951,21 @@ class PPO:
             save_dict["critic_obs_normalizer"] = (
                 self.critic_obs_normalizer.state_dict()
             )
+        # The adaptive reward widths are training state too: a resume that
+        # restarts them at their initial values loosens every adapted term at
+        # once, and the policy spends ~200 iterations drifting into the slack
+        # before the widths tighten again (every continuation of the fleet
+        # campaign showed that dip).
+        trackers = getattr(self.env, "adaptive_sigmas", {}) or {}
+        save_dict["adaptive_sigmas"] = {
+            name: {
+                "sigma": float(tracker.sigma),
+                "mean_squared_error": tracker.mean_squared_error,
+                "tightest": tracker.tightest,
+                "updates": int(tracker.updates),
+            }
+            for name, tracker in trackers.items()
+        }
         torch.save(save_dict, str(path))
 
     def load(self, path, load_optimizer=False, load_normalizers=True):
@@ -959,6 +975,17 @@ class PPO:
         self.value.load_state_dict(loaded["value_dict"])
         if load_optimizer:
             self.optimizer.load_state_dict(loaded["optimizer_state_dict"])
+            # Only a training resume restores the adapted reward widths; an
+            # evaluation keeps the configured ones (they only shape reward).
+            trackers = getattr(self.env, "adaptive_sigmas", {}) or {}
+            for name, state in (loaded.get("adaptive_sigmas") or {}).items():
+                tracker = trackers.get(name)
+                if tracker is None:
+                    continue
+                tracker.sigma = float(state["sigma"])
+                tracker.mean_squared_error = state.get("mean_squared_error")
+                tracker.tightest = state.get("tightest")
+                tracker.updates = int(state.get("updates", 0))
         self._load_normalizers(loaded, load_normalizers)
         infos = loaded["infos"]
         if isinstance(infos, dict):

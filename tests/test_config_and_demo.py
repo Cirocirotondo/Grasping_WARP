@@ -19,7 +19,8 @@ class ConfigAndDemoTest(unittest.TestCase):
         )
         self.assertEqual(env_cfg.env.rsi_early_probability, 0.20)
         self.assertEqual(env_cfg.env.rsi_pregrasp_start_index, 740)
-        self.assertEqual(env_cfg.env.rsi_max_start_index, 830)
+        self.assertEqual(env_cfg.env.rsi_max_start_index, 798)
+        self.assertEqual(env_cfg.env.rsi_snap_placement_from_index, 0)
         self.assertEqual(
             env_cfg.control.action_parameterization, "operational_space_arm"
         )

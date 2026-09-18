@@ -70,7 +70,17 @@ Evaluate a checkpoint (deterministic mean actions, plots):
 
 ```bash
 $PY scripts/evaluate.py --checkpoint logs/simtoolreal/<run>/best_model.pt
-$PY scripts/evaluate.py --checkpoint ... --viz newton     # watch it
+$PY scripts/evaluate.py --checkpoint ... --viz newton_gl  # watch it
+```
+
+Interactive evaluation from the browser -- choose the cuboid placement and
+the RSI start frame, run a measured cohort, scrub the rollout, get the
+diagnostics figure (needs `viser` and `yourdfpy` in the venv:
+`ISAACLAB_EXTRAS="--extra viser" ./setup.sh` and
+`uv pip install --python $PY yourdfpy`):
+
+```bash
+$PY scripts/evaluate_viser.py --checkpoint logs/simtoolreal/<run>/best_model.pt
 ```
 
 The environment is also registered as `SimToolReal-Grasp-Direct` for Isaac
@@ -157,7 +167,7 @@ simtoolreal_newton/
   runners/        AnimRL PPO, evaluators, plots, deployment score
   tasks/          gym registration for `isaaclab train`
   launch.py       make_env(): backend/visualizer selection, kit-less launch
-scripts/          train / evaluate / periodic_evaluate / convert_urdf / test_headless_env
+scripts/          train / evaluate / evaluate_viser / periodic_evaluate / convert_urdf / test_headless_env
 tools/            diagnostics
 assets/           URDF + meshes (usd/ generated), demonstrations/, banks/
 deps/IsaacLab     pinned Isaac Lab checkout + virtual environment (setup.sh)

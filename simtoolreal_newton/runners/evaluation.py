@@ -31,6 +31,21 @@ def preserve_random_state():
         np.random.set_state(numpy_state)
 
 
+def finite_mean(values: torch.Tensor) -> torch.Tensor:
+    """Mean over the environments whose value is finite.
+
+    One environment blown up by the solver (the guard resets it, but its
+    accumulated metrics are NaN) used to turn every mean of the evaluation
+    row into NaN. That env is dropped from the statistic instead.
+    """
+    finite = torch.isfinite(values)
+    if bool(finite.all()):
+        return values.mean()
+    if not bool(finite.any()):
+        return values.new_tensor(float("nan"))
+    return values[finite].mean()
+
+
 class DeterministicEvaluator:
     """Evaluate deterministic policy means on repeatable RSI cohorts."""
 
@@ -401,108 +416,108 @@ class DeterministicEvaluator:
         # deliberately not optimising for. The arm's joint Gaussians have since
         # been removed outright, which is the same conclusion carried further.
         mean_robot_position_reward = 0.5 * (
-            per_env_palm_keypoint_reward.mean()
-            + per_env_fingertip_keypoint_reward.mean()
+            finite_mean(per_env_palm_keypoint_reward)
+            + finite_mean(per_env_fingertip_keypoint_reward)
         )
         if object_pose_rewarded:
             mean_pose_score = 0.5 * (
-                mean_robot_position_reward + per_env_object_pose_score.mean()
+                mean_robot_position_reward + finite_mean(per_env_object_pose_score)
             )
         else:
             mean_pose_score = mean_robot_position_reward
         return {
-            "mean_reward": float((reward_sum / lengths).mean()),
+            "mean_reward": float(finite_mean((reward_sum / lengths))),
             "mean_palm_keypoint_reward": float(
-                per_env_palm_keypoint_reward.mean()
+                finite_mean(per_env_palm_keypoint_reward)
             ),
             "mean_fingertip_keypoint_reward": float(
-                per_env_fingertip_keypoint_reward.mean()
+                finite_mean(per_env_fingertip_keypoint_reward)
             ),
             "mean_palm_tilt_reward": float(
-                (palm_tilt_reward_sum / lengths).mean()
+                finite_mean((palm_tilt_reward_sum / lengths))
             ),
             "mean_palm_tilt_error_rad": float(
-                (palm_tilt_error_sum / lengths).mean()
+                finite_mean((palm_tilt_error_sum / lengths))
             ),
             "mean_ee_action_rate_reward": float(
-                (ee_action_rate_reward_sum / lengths).mean()
+                finite_mean((ee_action_rate_reward_sum / lengths))
             ),
             "mean_arm_joint_rate_reward": float(
-                (arm_joint_rate_reward_sum / lengths).mean()
+                finite_mean((arm_joint_rate_reward_sum / lengths))
             ),
             "mean_ik_residual_norm": float(
-                (ik_residual_norm_sum / lengths).mean()
+                finite_mean((ik_residual_norm_sum / lengths))
             ),
             "mean_arm_joint_delta_clipped": float(
-                (arm_joint_delta_clipped_sum / lengths).mean()
+                finite_mean((arm_joint_delta_clipped_sum / lengths))
             ),
             "mean_rms_ee_action_rate": float(
-                (rms_ee_action_rate_sum / lengths).mean()
+                finite_mean((rms_ee_action_rate_sum / lengths))
             ),
             "mean_rms_arm_joint_rate": float(
-                (rms_arm_joint_rate_sum / lengths).mean()
+                finite_mean((rms_arm_joint_rate_sum / lengths))
             ),
             "mean_rms_position_error": float(
-                (rms_position_error_sum / lengths).mean()
+                finite_mean((rms_position_error_sum / lengths))
             ),
             "mean_rms_velocity_error": float(
-                (rms_velocity_error_sum / lengths).mean()
+                finite_mean((rms_velocity_error_sum / lengths))
             ),
             "mean_hand_position_reward": float(
-                per_env_hand_position_reward.mean()
+                finite_mean(per_env_hand_position_reward)
             ),
             "mean_hand_velocity_reward": float(
-                (hand_velocity_reward_sum / lengths).mean()
+                finite_mean((hand_velocity_reward_sum / lengths))
             ),
             "mean_hand_action_rate_reward": float(
-                (hand_action_rate_reward_sum / lengths).mean()
+                finite_mean((hand_action_rate_reward_sum / lengths))
             ),
             "mean_object_position_reward": float(
-                per_env_object_position_reward.mean()
+                finite_mean(per_env_object_position_reward)
             ),
             "mean_object_orientation_reward": float(
-                per_env_object_orientation_reward.mean()
+                finite_mean(per_env_object_orientation_reward)
             ),
             "mean_fingertip_object_distance_reward": float(
-                (fingertip_object_distance_reward_sum / lengths).mean()
+                finite_mean((fingertip_object_distance_reward_sum / lengths))
             ),
             "mean_fingertip_object_distance_m": float(
-                (fingertip_object_distance_sum / lengths).mean()
+                finite_mean((fingertip_object_distance_sum / lengths))
             ),
             "mean_object_position_error_m": float(
-                (object_position_error_sum / lengths).mean()
+                finite_mean((object_position_error_sum / lengths))
             ),
             "mean_object_orientation_error_rad": float(
-                (object_orientation_error_sum / lengths).mean()
+                finite_mean((object_orientation_error_sum / lengths))
             ),
             "mean_fingertip_contact_reward": float(
-                (fingertip_contact_reward_sum / lengths).mean()
+                finite_mean((fingertip_contact_reward_sum / lengths))
             ),
             "mean_fingertip_contact_fraction": float(
-                (fingertip_contact_fraction_sum / lengths).mean()
+                finite_mean((fingertip_contact_fraction_sum / lengths))
             ),
             "mean_fingertip_contact_force_n": float(
-                (fingertip_contact_force_sum / lengths).mean()
+                finite_mean((fingertip_contact_force_sum / lengths))
             ),
-            "mean_object_pose_score": float(per_env_object_pose_score.mean()),
+            "mean_object_pose_score": float(finite_mean(per_env_object_pose_score)),
             "mean_rms_hand_position_error": float(
-                (rms_hand_position_error_sum / lengths).mean()
+                finite_mean((rms_hand_position_error_sum / lengths))
             ),
             "max_abs_hand_position_error": float(max_hand_position_error.max()),
             "max_abs_position_error": float(max_position_error.max()),
             "mean_peak_object_com_height_m": float(
-                peak_object_com_height.mean()
+                finite_mean(peak_object_com_height)
             ),
             "max_peak_object_com_height_m": float(
                 peak_object_com_height.max()
             ),
             "mean_peak_object_com_lift_m": float(
-                (peak_object_com_height - initial_object_com_height).mean()
+                finite_mean((peak_object_com_height - initial_object_com_height))
             ),
             "max_peak_object_com_lift_m": float(
                 (peak_object_com_height - initial_object_com_height).max()
             ),
-            "mean_episode_length": float(episode_steps.mean()),
+            "mean_episode_length": float(finite_mean(episode_steps)),
             "early_termination_fraction": float(early.float().mean()),
             "timeout_fraction": float(timeout.float().mean()),
             "action_target_clipped_fraction": clipped_target_components

@@ -80,6 +80,20 @@ class AdaptiveSigmaTest(unittest.TestCase):
         self.assertLess(reward(regressed, strict.update(regressed)), 0.07)
         self.assertGreater(reward(regressed, slack.update(regressed)), 0.25)
 
+    def test_the_reset_batch_cannot_pin_the_ratchet(self):
+        """s2s_track5_quiet: the first batch of a run is taken right after
+        every env was reset onto the reference, so its MSE is tiny. With the
+        ratchet armed from update one, the width could never relax above
+        1.5x that fluke and the term sat at 0.016 reward for the whole run."""
+        tracker = AdaptiveSigma(initial=0.5, floor=0.0103, decay=0.99, slack=1.5)
+        tracker.update(0.0195 ** 2)  # the reset-time fluke
+        self.assertIsNone(tracker.tightest)
+        for _ in range(3 * tracker.warmup_updates):
+            sigma = tracker.update(0.38 ** 2)  # what the policy actually does
+        self.assertTrue(tracker.warmed_up)
+        self.assertGreater(sigma, 0.3)
+        self.assertTrue(0.5 < reward(0.38 ** 2, sigma) < 0.7)
+
     def test_a_slack_below_one_is_rejected(self):
         with self.assertRaises(ValueError):
             AdaptiveSigma(initial=0.1, floor=0.01, slack=0.9)

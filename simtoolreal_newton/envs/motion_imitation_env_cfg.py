@@ -131,12 +131,14 @@ def _collision_props(animrl_cfg, nested: bool = False):
         )
     mj = animrl_cfg.sim.mjwarp
     solref = getattr(mj, "contact_solref", None)
+    solimp = getattr(mj, "contact_solimp", None)
     condim = getattr(mj, "contact_condim", None)
     fragments = [UsdPhysicsCollisionCfg(collision_enabled=True)]
-    if solref is not None or (condim is not None and int(condim) != 3):
+    if solref is not None or solimp is not None or (condim is not None and int(condim) != 3):
         fragments.append(
             MujocoCollisionCfg(
                 solref=tuple(float(v) for v in solref) if solref is not None else None,
+                solimp=tuple(float(v) for v in solimp) if solimp is not None else None,
                 condim=int(condim) if condim is not None else None,
             )
         )

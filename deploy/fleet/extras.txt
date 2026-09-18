@@ -1,0 +1,7 @@
+# Packages the desktop venv has beyond deps/IsaacLab/uv.lock (transform-bank
+# retargeting and the URDF loader of the viser tools). Versions as on the desktop.
+pytorch_kinematics==0.10.0
+yourdfpy==0.0.60
+# Training-video recording (ppo.py); imageio-ffmpeg ships its own ffmpeg binary.
+imageio==2.37.2
+imageio-ffmpeg==0.6.0

@@ -10,6 +10,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from simtoolreal_newton.cfg import (
     SimToolRealCfg,
@@ -132,6 +133,19 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="PATH=VALUE",
+        help=(
+            "Override one configuration field on top of the run's config.json "
+            "(same syntax as train.py; e.g. "
+            "object_randomization.fixed_transform_indices=[] to sample the "
+            "whole bank when the run trained on one pose). Repeatable."
+        ),
+    )
+    parser.add_argument(
         "--plot-dir",
         type=Path,
         default=None,
@@ -241,6 +255,10 @@ def main():
         raise ValueError("--print-every cannot be negative")
 
     env_cfg, train_cfg = load_saved_configuration(config_path)
+    if args.overrides:
+        from train import apply_overrides  # scripts/ is on sys.path next to this file
+
+        apply_overrides(env_cfg, train_cfg, args.overrides)
     env_cfg.seed = int(args.seed)
     env_cfg.env.num_envs = int(args.num_envs)
     env_cfg.env.play = True
