@@ -222,6 +222,14 @@ def make_robot_cfg(animrl_cfg, contact_enabled: bool) -> ArticulationCfg:
         ),
         activate_contact_sensors=bool(contact_enabled),
     )
+    if bool(getattr(asset, "self_collision", False)) and physics_name == "newton_mjwarp":
+        # Without this the importer filters every body pair of the
+        # articulation and no authored pair can re-open one; the complement of
+        # the allowed set is filtered explicitly in
+        # ``MotionImitationEnv._author_collision_filters``.
+        from isaaclab_newton.sim.schemas import NewtonArticulationCfg
+
+        spawn.articulation_props = [NewtonArticulationCfg(self_collision_enabled=True)]
     return ArticulationCfg(
         prim_path=ROBOT_PRIM,
         spawn=spawn,
@@ -301,14 +309,24 @@ def table_position(animrl_cfg):
     )
 
 
-def make_contact_sensor_cfg() -> ContactSensorCfg:
+def make_contact_sensor_cfg(self_collision_enabled: bool = False) -> ContactSensorCfg:
     # The five distal phalanges (the fixed tips are merged into them). The
     # body prims are nested under their parents, hence the leading ``.*``.
-    return ContactSensorCfg(
+    cfg = ContactSensorCfg(
         prim_path=ROBOT_PRIM + "/.*rl_dg_[1-5]_4",
         update_period=0.0,
         history_length=0,
     )
+    if self_collision_enabled:
+        # With finger-finger contacts live, ``net_forces_w`` would fold a
+        # fingertip pushing on its neighbour into the fingertip force feature.
+        # Filtering on the cuboid keeps the feature what it has always been.
+        # The sensor is built outside InteractiveScene, which is what would
+        # otherwise expand the namespace macro in the filter expression.
+        from isaaclab.cloner.cloner_cfg import expand_env_regex_ns
+
+        cfg.filter_prim_paths_expr = [expand_env_regex_ns(CUBE_PRIM)]
+    return cfg
 
 
 def observation_dims(animrl_cfg):
@@ -446,7 +464,11 @@ def build_env_cfg(animrl_cfg, num_envs: int | None = None, device: str | None = 
     cfg.cube = make_cube_cfg(animrl_cfg, reference.cube_pose[0].tolist())
     cfg.table = make_table_cfg(animrl_cfg)
     cfg.table_pos = table_position(animrl_cfg)
-    cfg.contact_sensor = make_contact_sensor_cfg() if contact_enabled else None
+    cfg.contact_sensor = (
+        make_contact_sensor_cfg(bool(getattr(animrl_cfg.asset, "self_collision", False)))
+        if contact_enabled
+        else None
+    )
     if bool(getattr(animrl_cfg.viewer, "training_camera_enabled", False)):
         cfg.camera = make_camera_cfg(
             animrl_cfg,

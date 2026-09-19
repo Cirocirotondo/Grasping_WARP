@@ -216,6 +216,15 @@ class SimToolRealCfg(BaseEnvCfg):
         # 23.1 once the policy makes the fingers jitter. Off, the hand can pass
         # through itself, while external robot-cube contacts remain enabled.
         self_collision = False
+        # Which fingers (1 = thumb .. 5 = little) may collide with the OTHER
+        # listed fingers; the default re-enables only the four long fingers.
+        self_collision_fingers = [2, 3, 4, 5]
+        # True keeps only neighbouring finger pairs (|fa - fb| == 1).
+        self_collision_adjacent_fingers_only = False
+        # True also lets the listed fingers collide with the palm body.
+        self_collision_with_palm = False
+        # True also lets non-adjacent links of the same finger collide.
+        self_collision_same_finger = False
         friction = 0.5
         # 1.5 under PhysX, whose default combine mode averages the two
         # materials of a contact: fingertip 1.5 with cuboid 0.5 acted as 1.0.

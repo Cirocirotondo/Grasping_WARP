@@ -57,6 +57,7 @@ from simtoolreal_newton.envs.controller import (
     WRIST_BODY_NAME,
     pd_gain_arrays,
 )
+from simtoolreal_newton.envs.self_collision import filtered_body_pairs
 from simtoolreal_newton.envs.object_scale import (
     inertia_factor,
     mass_factor,
@@ -463,6 +464,11 @@ class MotionImitationEnv(DirectRLEnv):
         merged palm shapes) and the table keep colliding with the cuboid.
         Newton's USD importer honours the pairs on body and collider prims and
         replicates them with the prototype environment.
+
+        With ``asset.self_collision`` on, the articulation no longer filters
+        its own bodies wholesale (see ``make_robot_cfg``), so every robot body
+        pair outside :func:`~simtoolreal_newton.envs.self_collision.allowed_body_pairs`
+        is filtered here instead, once, on the lexicographically smaller body.
         """
         from pxr import UsdPhysics
 
@@ -474,6 +480,11 @@ class MotionImitationEnv(DirectRLEnv):
             p for p in stage.Traverse() if str(p.GetPath()).startswith(table_prim) and p.HasAPI(UsdPhysics.CollisionAPI)
         ]
         cube_prim = stage.GetPrimAtPath("/World/envs/env_0/Cube")
+        self_pairs = {}
+        if self.self_collision_enabled:
+            for pair in filtered_body_pairs(self.animrl_cfg.asset, bodies):
+                first, second = sorted(pair)
+                self_pairs.setdefault(first, []).append(second)
         for name, prim in bodies.items():
             api = UsdPhysics.FilteredPairsAPI.Apply(prim)
             rel = api.CreateFilteredPairsRel()
@@ -481,6 +492,8 @@ class MotionImitationEnv(DirectRLEnv):
                 rel.AddTarget(collider.GetPath())
             if name in ARM_BODY_NAMES and cube_prim.IsValid():
                 rel.AddTarget(cube_prim.GetPath())
+            for other in sorted(self_pairs.get(name, ())):
+                rel.AddTarget(bodies[other].GetPath())
         self.arm_collision_body_names = tuple(n for n in bodies if n in ARM_BODY_NAMES)
         self.hand_collision_body_names = tuple(n for n in bodies if n not in ARM_BODY_NAMES)
 
@@ -929,7 +942,13 @@ class MotionImitationEnv(DirectRLEnv):
     def _refresh_contact_forces(self) -> None:
         if self.contact_sensor is None:
             return
-        forces = self.contact_sensor.data.net_forces_w.torch
+        if self.self_collision_enabled:
+            # Only the cuboid is a filter object, so the filter axis carries
+            # the fingertip-cuboid force alone; finger-finger contacts, which
+            # ``net_forces_w`` would now include, never reach the feature.
+            forces = self.contact_sensor.data.force_matrix_w.torch.sum(dim=2)
+        else:
+            forces = self.contact_sensor.data.net_forces_w.torch
         self.net_contact_forces.copy_(forces[:, self._contact_sensor_order])
 
     # ------------------------------------------------------------------
