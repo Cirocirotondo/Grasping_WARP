@@ -11,6 +11,14 @@ reference comes from its nearest bank entry -- the same approximation training
 makes, so what is measured here is what the policy was trained against. The
 residual between the two is reported rather than hidden.
 
+The cuboid's size is a free parameter too (``--cube-scale`` and the "Cube
+scale" slider): one factor scales the bar's three sides, its mass with the
+volume, and the reference pose is lifted so the scaled bar still rests on the
+table -- exactly what the scale-randomised training does per episode. Every
+environment of a rollout gets the same factor. A run that observes the scale
+(``object_randomization.observe_scale``) is told the true value; a run trained
+at the nominal size only cannot see it, and the GUI says which case applies.
+
 Run it with the project's interpreter (``viser`` and ``yourdfpy`` must be
 installed in it: ``ISAACLAB_EXTRAS="--extra viser" ./setup.sh`` and
 ``uv pip install --python deps/IsaacLab/.venv/bin/python yourdfpy``):
@@ -270,6 +278,7 @@ class RolloutFrame:
         "q",
         "cube_position",
         "cube_wxyz",
+        "cube_scale",
         "reference_q",
         "reference_cube_position",
         "reference_cube_wxyz",
@@ -439,6 +448,16 @@ class EvaluationViewer:
         )
         self.env.max_episode_length = int(self.env.reference.last_index)
         self.env.cfg.env.episode_length = self.env.max_episode_length
+        # The training range is kept for the readout; the rollouts themselves
+        # run at the one factor chosen in the GUI (initially --cube-scale).
+        randomization = env_cfg.object_randomization
+        self.training_scale_range = (
+            float(randomization.scale_min),
+            float(randomization.scale_max),
+        )
+        self.policy_observes_scale = bool(randomization.observe_scale)
+        self.env.enable_object_scale()
+        self._apply_cube_scale(float(args.cube_scale))
         self.ghost_offset = np.asarray(
             [float(value) for value in env_cfg.viewer.reference_ghost_offset],
             dtype=np.float64,
@@ -452,6 +471,22 @@ class EvaluationViewer:
         bank = self.env.transform_bank
         self.bank_translation = bank.translation.detach().cpu().numpy()
         self.bank_yaw_deg = np.rad2deg(bank.yaw_rad.detach().cpu().numpy())
+
+    def _apply_cube_scale(self, scale: float) -> None:
+        """Make the next reset give every environment the bar scaled by ``scale``.
+
+        The env samples the factor at reset from its randomisation config, so
+        pinning the range to one value (and dropping the training anchors) is
+        all it takes; geometry, mass, inertia and the reference height follow.
+        """
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError("The cube scale must be a positive number")
+        randomization = self.env.animrl_cfg.object_randomization
+        randomization.scale_min = float(scale)
+        randomization.scale_max = float(scale)
+        randomization.scale_nominal_probability = 0.0
+        randomization.scale_anchors = []
+        self.cube_scale = float(scale)
 
     def _build_policy(self) -> None:
         # The saved train_cfg may carry record_video=True from a training run
@@ -508,11 +543,19 @@ class EvaluationViewer:
                 step=0.5,
                 initial_value=0.0,
             )
+            self.scale = gui.add_slider(
+                "Cube scale (x nominal)",
+                min=0.5,
+                max=2.0,
+                step=0.01,
+                initial_value=float(self.args.cube_scale),
+            )
             reset_transform = gui.add_button("Reset placement")
             reset_transform.on_click(self._reset_transform)
             self.placement_readout = gui.add_markdown("")
             self.xy.on_update(self._update_placement_readout)
             self.yaw.on_update(self._update_placement_readout)
+            self.scale.on_update(self._update_placement_readout)
         with gui.add_folder("Episode start", expand_by_default=True):
             self.start_frame = gui.add_slider(
                 "RSI start frame",
@@ -560,13 +603,18 @@ class EvaluationViewer:
         self._update_placement_readout()
         print(
             "Training range: x [{:+.3f}, {:+.3f}] m, y [{:+.3f}, {:+.3f}] m, "
-            "yaw [{:+.1f}, {:+.1f}] deg".format(
+            "yaw [{:+.1f}, {:+.1f}] deg, cube scale [{:.2f}, {:.2f}] ({})".format(
                 randomization.translation_x_min_m,
                 randomization.translation_x_max_m,
                 randomization.translation_y_min_m,
                 randomization.translation_y_max_m,
                 randomization.yaw_min_deg,
                 randomization.yaw_max_deg,
+                self.training_scale_range[0],
+                self.training_scale_range[1],
+                "observed by the policy"
+                if self.policy_observes_scale
+                else "not observed by the policy",
             )
         )
 
@@ -632,8 +680,38 @@ class EvaluationViewer:
                 "on. The bank only admits transforms whose whole clip solves, "
                 "so beyond its coverage the residual grows without bound."
             )
+        scale = float(self.scale.value)
+        scale_low, scale_high = self.training_scale_range
+        scale_inside = scale_low - 1e-6 <= scale <= scale_high + 1e-6
+        if scale_low == scale_high:
+            scale_training = "trained at x{:.2f} only".format(scale_low)
+        else:
+            scale_training = "training range [{:.2f}, {:.2f}]".format(
+                scale_low, scale_high
+            )
+        if not scale_inside:
+            scale_training = "**outside** the training size ({}, extrapolation)".format(
+                "x{:.2f}".format(scale_low)
+                if scale_low == scale_high
+                else "[{:.2f}, {:.2f}]".format(scale_low, scale_high)
+            )
+        scale_line = (
+            "**Cube scale:** x{:.2f} -> {:.1f} x {:.1f} x {:.1f} cm, mass x{:.2f}; "
+            "{}; the policy {} the scale  \n".format(
+                scale,
+                *(100.0 * scale * side for side in CUBE_DIMENSIONS),
+                scale ** 3
+                if bool(
+                    getattr(randomization, "scale_mass_with_volume", True)
+                )
+                else 1.0,
+                scale_training,
+                "observes" if self.policy_observes_scale else "cannot see",
+            )
+        )
         self.placement_readout.content = (
-            "**Requested cuboid transform:** x={:+.3f}, y={:+.3f} m, "
+            scale_line
+            + "**Requested cuboid transform:** x={:+.3f}, y={:+.3f} m, "
             "yaw={:+.1f}°  \n"
             "**Serving bank reference #{}:** x={:+.3f}, y={:+.3f} m, "
             "yaw={:+.1f}°  \n"
@@ -760,6 +838,7 @@ class EvaluationViewer:
             cube_wxyz=quaternion_xyzw_to_wxyz(
                 env.cube_orientation[0].detach().cpu().numpy().astype(np.float64)
             ),
+            cube_scale=float(env.object_scale[0]),
             reference_q=reference_q,
             reference_cube_position=reference_cube_position,
             reference_cube_wxyz=reference_cube_wxyz,
@@ -781,6 +860,7 @@ class EvaluationViewer:
                 self.frame = 0
             self.final_metrics = {}
             env.cfg.termination.enabled = not bool(self.keep_going.value)
+            self._apply_cube_scale(float(self.scale.value))
             env.reset(
                 reference_index=start_index,
                 translation_xy=(float(translation[0]), float(translation[1])),
@@ -1158,19 +1238,24 @@ class EvaluationViewer:
     def _rollout_stem(self, start_index: int) -> str:
         """File stem naming a rollout by checkpoint, placement and start frame."""
         translation, yaw_rad = self._requested_transform()
-        return "viser_{}_x{:+.0f}_y{:+.0f}_yaw{:+.0f}_rsi{}".format(
+        stem = "viser_{}_x{:+.0f}_y{:+.0f}_yaw{:+.0f}_rsi{}".format(
             self.checkpoint.stem,
             1e3 * translation[0],
             1e3 * translation[1],
             np.rad2deg(yaw_rad),
             start_index,
         )
+        scale = float(self.scale.value)
+        if abs(scale - 1.0) > 1e-6:
+            stem += "_scale{:.2f}".format(scale)
+        return stem
 
     # --------------------------------------------------------------- rendering
 
     def _show_reset_pose(self) -> None:
         """Draw the reset state so the scene is populated before the first run."""
         translation, yaw_rad = self._requested_transform()
+        self._apply_cube_scale(float(self.scale.value))
         self.env.reset(
             reference_index=int(self.start_frame.value),
             translation_xy=(float(translation[0]), float(translation[1])),
@@ -1189,9 +1274,11 @@ class EvaluationViewer:
         self.robot.update_cfg(frame.q)
         self.cube.position = frame.cube_position
         self.cube.wxyz = frame.cube_wxyz
+        self.cube.scale = frame.cube_scale
         self.reference_robot.update_cfg(frame.reference_q)
         self.reference_cube.position = frame.reference_cube_position + self.ghost_offset
         self.reference_cube.wxyz = frame.reference_cube_wxyz
+        self.reference_cube.scale = frame.cube_scale
         metrics = frame.metrics
         if not metrics:
             self.frame_readout.content = (
@@ -1286,6 +1373,18 @@ def parse_args() -> argparse.Namespace:
         help="Physics backend (default: config).",
     )
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--cube-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Initial value of the GUI's cube-scale slider: one factor on the "
+            "bar's three sides (1.0 = the nominal 15 x 5 x 5 cm), mass with "
+            "the volume, reference lifted so the bar rests on the table. Any "
+            "checkpoint accepts it; only runs trained with observe_scale are "
+            "told the value."
+        ),
+    )
     parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument(

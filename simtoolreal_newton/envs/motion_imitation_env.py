@@ -1095,6 +1095,20 @@ class MotionImitationEnv(DirectRLEnv):
             )
         self._object_nominal_shape_scale = self._object_shape_scale.clone()
 
+    def enable_object_scale(self) -> None:
+        """Switch the per-episode scale machinery on after construction.
+
+        Evaluation tools that change the bar size live (``scripts/evaluate_viser.py``)
+        need the solver binding even for a run that trained at the nominal size
+        only, where the configured range is ``[1, 1]`` and the constructor left
+        it off. Idempotent; the scale itself is still what
+        ``object_randomization.scale_min/scale_max`` say at the next reset.
+        """
+        if self.object_scale_enabled:
+            return
+        self.object_scale_enabled = True
+        self._setup_object_scale()
+
     def _apply_object_scale(self, env_ids: torch.Tensor, scale: torch.Tensor) -> None:
         """Write the scale factor of ``env_ids`` into the solver (geometry, mass, inertia)."""
         scale = scale.to(device=self.device, dtype=torch.float32)
