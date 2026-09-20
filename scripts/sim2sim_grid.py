@@ -64,8 +64,10 @@ def parse_args():
 def newton_lookup(pattern, scale):
     if pattern is None:
         return {}
-    path = Path(pattern.format(scale="{:g}".format(scale)))
-    if not path.is_file():
+    # Run directories name the sweeps "_s1.0.json", other tools "_s1.json".
+    candidates = [Path(pattern.format(scale=text)) for text in ("{:.1f}".format(scale), "{:g}".format(scale))]
+    path = next((c for c in candidates if c.is_file()), None)
+    if path is None:
         return {}
     rows = json.load(path.open())["rows"]
     return {(round(r["x_m"], 4), round(r["y_m"], 4), round(r["yaw_deg"], 2)): r for r in rows}
