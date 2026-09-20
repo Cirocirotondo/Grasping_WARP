@@ -158,6 +158,42 @@ randomisation (gains, masses, impulses and sensor noise are randomised as
 before). The retargeting tools (`scripts/build_transform_bank.py`) still need
 `pytorch_kinematics` (`uv pip install pytorch_kinematics`).
 
+## MuJoCo sim2sim
+
+`scripts/run_mujoco_sim2sim.py` plays a checkpoint in **native MuJoCo** (no
+Isaac Lab, no Warp, no GPU needed) built from the run's own `config.json`:
+the training URDF with the implicit PD drives and their gains, the table, the
+bar (scaled with `--cube-scale`, mass with the volume), the `sim.mjwarp`
+contact model (solref/solimp, elliptic cones, impratio, condim, force margin,
+8 substeps) and the training collision graph including the selective finger
+self-collision of `asset.self_collision`. The policy sees the same 112/113-D
+observation and drives the same 26 targets as in training (`sim2sim/observation.py`,
+`sim2sim/controller.py` call the environment's own rotation, symmetry, IK and
+kinematics helpers), and each episode reports what `scripts/sweep_pose_success.py`
+reports in Newton: the largest bar position error along the way (the 7 cm
+gate), the peak lift and the final pose errors.
+
+```bash
+# the demonstration's own pose, with the viewer and the green reference ghost
+$PY scripts/run_mujoco_sim2sim.py --checkpoint logs/staged/<run>/model_<N>.pt
+# headless, several bank entries, a 1.2x bar, metrics to JSON
+$PY scripts/run_mujoco_sim2sim.py --checkpoint ... --headless --no-realtime \
+    --bank-index 122 57 900 --cube-scale 1.2 --output sim2sim.json
+# one continuous placement (served by its nearest bank entry, as the training reset does)
+$PY scripts/run_mujoco_sim2sim.py --checkpoint ... --x 0.03 --y 0.10 --yaw 20
+# probe the contact model: any env field can be overridden
+$PY scripts/run_mujoco_sim2sim.py --checkpoint ... --headless --set sim.mjwarp.contact_solref=[0.02,1.0]
+```
+
+Per-joint tracking/action figures and `rollout_data.npz` land in
+`sim2sim_plots/<episode>/` beside the checkpoint (`--plot-dir`, `--no-plots`).
+Known differences from the training simulator: MuJoCo's `margin` inflates the
+contact surface, so only Newton's *force* margin is carried over (its detection
+gap has no counterpart); collision hulls are MuJoCo's convex hulls of the same
+STL meshes; friction combines by maximum in both. `tests/test_sim2sim.py`
+checks the collision graph, the drives, the contact parameters, the scale and
+that MuJoCo's palm and fingertip frames agree with `envs/kinematics.py`.
+
 ## Layout
 
 ```
@@ -165,9 +201,10 @@ simtoolreal_newton/
   cfg/            AnimRL-style Python configuration (env + train)
   envs/           task modules (pure torch) + motion_imitation_env.py (Isaac Lab)
   runners/        AnimRL PPO, evaluators, plots, deployment score
+  sim2sim/        native MuJoCo replay of a checkpoint (scripts/run_mujoco_sim2sim.py)
   tasks/          gym registration for `isaaclab train`
   launch.py       make_env(): backend/visualizer selection, kit-less launch
-scripts/          train / evaluate / evaluate_viser / periodic_evaluate / convert_urdf / test_headless_env
+scripts/          train / evaluate / evaluate_viser / run_mujoco_sim2sim / periodic_evaluate / convert_urdf / test_headless_env
 tools/            diagnostics
 assets/           URDF + meshes (usd/ generated), demonstrations/, banks/
 deps/IsaacLab     pinned Isaac Lab checkout + virtual environment (setup.sh)
