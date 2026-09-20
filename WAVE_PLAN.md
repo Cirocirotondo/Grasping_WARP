@@ -71,3 +71,54 @@ Same recipe + same seed + same checkpoint does NOT give the same run: `s2_lr5e6_
 
 ## Closing rule (22:25)
 The spread between two draws of the deliverable recipe (s42 vs s42_b: up to 0.47 in f@7, 0.432 vs 0.680 on best worst-scale) exceeds every lever effect measured tonight. No new queue lines after the ones written above. When your host's queue is exhausted: write a final summary section in your notes file (every run, best rung, three-scale numbers, verdict; one paragraph of lessons that survive the reproducibility note), then hand back with a ≤ 15-line message and stop. Criterion hits still get the full package.
+
+# Wave SC1 (2026-09-19 20:53 CEST) — pose deliverable recipe with finger self-collision ON
+
+Lever (commit 184b92f, on both mirrors): `--set asset.self_collision=true` enables collisions between the phalanges of fingers 2–5 (index…little) only; palm, thumb and same-finger pairs stay filtered; fingertip contact forces are cube-filtered. Verified: probe shows exactly 96 hand body pairs; cost 19.7 → 45.6 ms/step at 4096 envs (adjacent-only 41, not worth it); zero-shot on the scale deliverable 17300: pose 122 250 → 212/250 at scale 1.0, 250 → 151/250 with 0.8–1.2 scales, so the old policy relied on interpenetration and must be retrained.
+
+Recipe: warm start from `logs/staged/w6_s7_cont2_it17000/model_17000.pt` (112 obs, nominal scale) with ALL flags of `logs/staged/w6_s7_cont2_it17000/set_flags.txt` (filter the `learning_rate` line and pass the arm's lr), plus `--set asset.self_collision=true`. Scale off (do not pass scale flags). 4096 envs. Every sweep/eval loads the run's config.json, so self-collision is on in the ladder automatically; verify `asset.self_collision: true` and `observation_dim 112` in the run's config.json after launch.
+
+Ladder every 100 (§12 mechanics from the S2 notes files): grid RSI 0 at scale 1.0 (250 poses, gate 7 cm) + pose 122 (250 repeats) on every rung; on candidate rungs (fail@7 ≤ 0.45 and pose 122 ≥ 240): duplicate grid (`--seed 2`), median orientation (DQ > 0.6 rad), arm tracking `scripts/evaluate.py` RSI 0 (`--output <run>/eval_rsi0_model_<N>.json`; reference 0.146 rad / 0.029 m / 0.0092), §8 clips (3–4 cube poses from frame 0 + one from RSI 760), copied home, checkpoint staged as `logs/staged/sc1_<arm>_it<N>/` with config.json. Criterion SC1: fail@7 ≤ 0.45, pose 122 ≥ 240/250, orientation ≤ 0.6, palm/ee-rate tracking within 20% of the reference. Stop rules §10 (amendment 3) apply; budgets are final (no continuation of a winning rung).
+
+Reporting (unchanged): message the coordinator only for a criterion hit with package, a finished/stopped run (one compact message with the full ladder table), or a rule gap. Notes file per host is the source for the hourly dispatcher.
+
+Every run is a draw: two draws per lr on the servers.
+
+### tars
+1. GPU 0 `sc1_lr2e5_s7_a` — lr 2e-5, seed 7, 17000→18000.
+2. GPU 1 `sc1_lr5e6_s7_a` — lr 5e-6, seed 7, 17000→17800.
+### case
+1. GPU 0 `sc1_lr2e5_s7_b` — lr 2e-5, seed 7, 17000→18000.
+2. GPU 1 `sc1_lr5e6_s7_b` — lr 5e-6, seed 7, 17000→17800.
+### desktop (beside the user's viewer; 4096 envs fit)
+1. `sc1_lr1e5_s7` — lr 1e-5, seed 7, 17000→18000.
+When a host's queue is exhausted: final summary section in the notes file, ≤ 15-line closing message, stop. A winning rung is the seed of wave SC2 (scale ±20%, the S2 recipe: widen with expand_checkpoint_observation.py, lr 5e-6, 800 iterations, three-scale ladder).
+
+# Wave SC2 (2026-09-19 22:06 CEST) — scale ±20% on the self-collision winner
+
+Seed: `logs/staged/sc1_lr2e5_s7_a_it17200/model_17200.pt` (112 obs, self-collision on). Widen it with `scripts/expand_checkpoint_observation.py` (as done for `logs/staged/w6_s7_cont2_it17000_scale/`) into `logs/staged/sc1_lr2e5_s7_a_it17200_scale/` (model_17200.pt with 113 inputs + config.json + set_flags.txt), on the desktop and on the mirrors. Flags = the SC1 flags (`logs/staged/w6_s7_cont2_it17000/set_flags.txt` minus learning_rate) + `--set asset.self_collision=true --set object_randomization.scale_min=0.8 --set object_randomization.scale_max=1.2 --set object_randomization.observe_scale=true --set train.algorithm.learning_rate=5e-06`. 4096 envs, seed 42, 17200→18000 (800). Verify config.json: self_collision true, observation_dim 113, scale 0.8/1.2 observed, lr 5e-6.
+Ladder every 100 at scales 0.8 / 1.0 / 1.2 (`--set object_randomization.scale_min=S --set object_randomization.scale_max=S`), grid + pose 122 on every rung at every scale; duplicate grids on candidate rungs; orientation DQ > 0.6; arm tracking at 1.0 and 0.8. Criterion §11: worst scale fail@7 ≤ 0.45 and pose 122 ≥ 240 at every scale. Package as before (clips at three scales + RSI 760, staged `logs/staged/sc2_<arm>_it<N>/`). Every run is a draw: two draws.
+### tars
+1. GPU 0 `sc2_lr5e6_s42_a`; 2. GPU 1 `sc2_lr5e6_s42_b` (identical recipe, second draw).
+### desktop
+1. `sc2_lr5e6_s42_c` — third draw of the SC2 recipe, launched once `logs/staged/sc1_lr2e5_s7_a_it17200_scale/model_17200.pt` exists on the desktop (tars agent produces it).
+### tars (added 2026-09-19 23:39 CEST, after draws a/b closed without a hit; 0.8 is the binding side on every rung)
+3. GPU 0 `sc2_lr5e6_s42_d` — fourth draw of the plain SC2 recipe, budget 400 (17200→17600).
+4. GPU 1 `sc2_anchor_s42` — SC2 recipe + `--set object_randomization.scale_nominal_probability=0.25 --set object_randomization.scale_anchors=[[0.8,0.15]]`, budget 400 (17200→17600).
+### case (2026-09-19 23:58 CEST; GPU 1 is occupied by another user's job — never touch it; GPU 0 only)
+1. Ladder of the finished `sc1_lr2e5_s7_b` (18001, no sweeps run yet): grid + pose 122 at 1.0 on 17100…18000, candidate packages per SC1 rules.
+2. GPU 0 `sc2w_lr5e6_s42_a` — single-step variant: scale AND self-collision from the S2 seed `logs/staged/w6_s7_cont2_it17000_scale/model_17000.pt` (113 obs, mirror has it), flags `logs/staged/w6_s7_cont2_it17000_scale/set_flags.txt` (learning_rate filtered) + `--set train.algorithm.learning_rate=5e-06 --set asset.self_collision=true`, seed 42, 17000→17800, three-scale ladder, §11 criterion. Motivation: the widened SC1 winner is a 200-iteration knife-edge (pose 122 at 1.2 already 1/250 on its first rung); one adaptation from the settled w6 17000 instead of two sequential ones.
+
+# Wave SC3 (2026-09-20 00:32 CEST) — weaker anchor between the two SC2 near-misses
+Seed `logs/staged/sc1_lr2e5_s7_a_it17200_scale/model_17200.pt`, SC2 recipe (lr 5e-6, seed 42, self-collision, scale 0.8–1.2 observed) + `--set object_randomization.scale_nominal_probability=0.15 --set object_randomization.scale_anchors=[[0.8,0.10]]`, budget 200 (17200→17400), ladder at 17300 and 17400 at three scales with pose 122 everywhere, duplicates on candidates. §11 criterion.
+### tars
+1. GPU 0 `sc3_anchor15_s42_a`; 2. GPU 1 `sc3_anchor15_s42_b`.
+
+# Wave SC4 (2026-09-20 01:02 CEST) — last round: repeats of the two half-winners, budget 200
+Seed and recipe as SC2 (widened SC1 winner, lr 5e-6, seed 42, self-collision, scale 0.8–1.2 observed), 17200→17400, ladder at 17300 and 17400 at three scales with pose 122 everywhere, duplicates on candidates, §11 criterion.
+### tars (sequential per card)
+1. GPU 0 `sc4_plain_e` then `sc4_plain_f` (no anchor).
+2. GPU 1 `sc4_anchor25_c` then `sc4_anchor25_d` (`scale_nominal_probability=0.25`, `scale_anchors=[[0.8,0.15]]`).
+Closing rule: no lines after these; final summary and stop.
+### case (SC4, 2026-09-20 01:08 CEST; GPU 0 only)
+1. `sc4_sc2w_b` then 2. `sc4_sc2w_c` — repeats of `sc2w_lr5e6_s42_a` (seed `logs/staged/w6_s7_cont2_it17000_scale/model_17000.pt`, its set_flags minus learning_rate, + scale 0.8/1.2 observed, lr 5e-6, self_collision, seed 42), budget 300 (17000→17300), ladder at 17100/17200/17300 at three scales with pose 122 everywhere, duplicates on candidates, §11 criterion. Last case lines.
