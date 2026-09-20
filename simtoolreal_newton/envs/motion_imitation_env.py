@@ -851,14 +851,17 @@ class MotionImitationEnv(DirectRLEnv):
         robot_view = self.robot._root_view
         if not getattr(robot_view, "shapes_contiguous", True):
             raise RuntimeError("The robot's shapes are not contiguous in the Newton model; cannot bind friction")
+        # Every shape of the distal phalanges carries the pad material: the
+        # collision hulls (``rl_dg_<f>_4_c``, ``rl_dg_<f>_tip_c``) and, on
+        # imports that keep them as shapes, the visual meshes of the same
+        # links -- hence a prefix match and a lower bound, not an exact count.
         shape_names = list(robot_view.shape_names)
-        pad = [
-            i
-            for i, name in enumerate(shape_names)
-            if any(name.startswith("rl_dg_{}_4".format(f)) or name.startswith("rl_dg_{}_tip".format(f)) for f in range(1, 6))
-        ]
-        if len(pad) != 10:
-            raise RuntimeError("Expected the ten fingertip shapes, found {} in {}".format(len(pad), shape_names))
+        prefixes = tuple(
+            "rl_dg_{}_{}".format(f, part) for f in range(1, 6) for part in ("4", "tip")
+        )
+        pad = [i for i, name in enumerate(shape_names) if name.startswith(prefixes)]
+        if len(pad) < 10:
+            raise RuntimeError("Expected at least the ten fingertip shapes, found {} in {}".format(len(pad), shape_names))
         pad = torch.as_tensor(pad, dtype=torch.long, device=self.device)
         for attribute in ("shape_material_mu", "shape_material_mu_torsional"):
             rows = bind(robot_view, attribute)
