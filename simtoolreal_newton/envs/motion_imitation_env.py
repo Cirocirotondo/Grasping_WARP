@@ -116,6 +116,8 @@ from simtoolreal_newton.envs.rsi_noise import perturb_reference_pose
 from simtoolreal_newton.envs.sensing import (
     ActionDelay,
     add_observation_noise,
+    perturb_cube_pose_observation,
+    sample_cube_pose_bias,
     sample_position_bias,
 )
 from simtoolreal_newton.envs.transform_bank import TransformBank, nearest_transform_indices
@@ -579,6 +581,11 @@ class MotionImitationEnv(DirectRLEnv):
                 order.append(matches[0])
             self._contact_sensor_order = torch.as_tensor(order, dtype=torch.long, device=self.device)
         self.robot_body_indices = torch.arange(self.robot.num_bodies, dtype=torch.long, device=self.device)
+        # Impulse targets: the arm proper (base to wrist_2) and the phalanges.
+        arm_ids, _ = self.robot.find_bodies(list(ARM_BODY_NAMES), preserve_order=True)
+        self.arm_body_indices = torch.as_tensor(arm_ids, dtype=torch.long, device=self.device)
+        finger_ids, _ = self.robot.find_bodies(["rl_dg_[1-5]_[1-4]"])
+        self.finger_body_indices = torch.as_tensor(finger_ids, dtype=torch.long, device=self.device)
         self.cube_body_index_tensor = torch.zeros(1, dtype=torch.long, device=self.device)
 
     def _read_joint_limits(self) -> None:
@@ -633,6 +640,10 @@ class MotionImitationEnv(DirectRLEnv):
             self.domain_randomization.obs_q_bias_rad if self.domain_randomization.enabled else 0.0,
             device,
         )
+        # Per-episode offset of the observed bar pose (position, rotation
+        # vector), redrawn at every reset; zero unless the noise family is on.
+        self.cube_observation_position_bias = torch.zeros((n, 3), dtype=torch.float32, device=device)
+        self.cube_observation_rotation_bias = torch.zeros((n, 3), dtype=torch.float32, device=device)
         if self.critic_parameter_dim:
             self.critic_parameter_table = self.domain_randomization.privileged_table(device=device)
         self.rew_buf = torch.zeros(n, dtype=torch.float32, device=device)
@@ -786,15 +797,89 @@ class MotionImitationEnv(DirectRLEnv):
         if bool(torch.any(link_scale != 1.0)):
             robot_mass = self.robot.data.default_mass.torch.to(self.device)
             self.robot.set_masses_index(masses=(robot_mass * link_scale.view(n, 1)).contiguous())
+        self._apply_friction_randomization()
         for key in UNAPPLIED_PARAMETERS:
             values = [randomization.multiplier(key, i) for i in range(n)]
             if any(abs(v - 1.0) > 1e-9 for v in values):
                 logger.warning(
-                    "domain_randomization.%s is not applied on the Isaac Lab port yet (per-environment "
-                    "friction needs solver-side material writes); every environment keeps the nominal value "
-                    "and the critic is not told about this parameter.",
+                    "domain_randomization.%s is not applied on this backend; every environment keeps the "
+                    "nominal value and the critic is not told about this parameter.",
                     key,
                 )
+
+    def _apply_friction_randomization(self) -> None:
+        """Per-environment contact friction, written into the solver's per-world material arrays.
+
+        The same route the per-episode bar scale takes: bind the Newton model's
+        ``shape_material_mu`` (and the torsional/rolling terms) through the
+        asset views, multiply the rows of each world, and notify
+        ``SHAPE_PROPERTIES`` so MuJoCo-Warp refreshes ``geom_friction`` per
+        world. Contacts combine the two shapes' friction by the maximum, so
+        the fingertip (1.0) decides the fingertip-bar pair and the bar and
+        table (0.5 each) decide theirs: each side carries its own multiplier.
+        The fingertip multiplier scales the sliding and torsional terms
+        together, the torsional one being what holds the bar's gravity moment
+        in a two-finger pinch.
+        """
+        randomization = self.domain_randomization
+        keys = ("fingertip_friction", "object_friction", "table_friction")
+        multipliers = {
+            key: torch.tensor(
+                [randomization.multiplier(key, i) for i in range(self.num_envs)],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            for key in keys
+        }
+        if all(bool(torch.all(values == 1.0)) for values in multipliers.values()):
+            return
+        if "physx" in self.scene.physics_backend:
+            raise ValueError("Per-environment friction randomization is only implemented on the Newton backend")
+        import warp as wp  # noqa: PLC0415
+        from isaaclab_newton.physics import NewtonManager  # noqa: PLC0415
+        from newton import ModelFlags  # noqa: PLC0415
+
+        model = NewtonManager.get_model()
+        n = self.num_envs
+
+        def bind(view, attribute):
+            binding = wp.to_torch(view.get_attribute(attribute, model))
+            return binding.reshape(n, -1)
+
+        # Fingertips: every shape of the five distal phalanges (the merged tip
+        # included), the ones _bind_fingertip_material gave the grippier pad.
+        robot_view = self.robot._root_view
+        if not getattr(robot_view, "shapes_contiguous", True):
+            raise RuntimeError("The robot's shapes are not contiguous in the Newton model; cannot bind friction")
+        shape_names = list(robot_view.shape_names)
+        pad = [
+            i
+            for i, name in enumerate(shape_names)
+            if any(name.startswith("rl_dg_{}_4".format(f)) or name.startswith("rl_dg_{}_tip".format(f)) for f in range(1, 6))
+        ]
+        if len(pad) != 10:
+            raise RuntimeError("Expected the ten fingertip shapes, found {} in {}".format(len(pad), shape_names))
+        pad = torch.as_tensor(pad, dtype=torch.long, device=self.device)
+        for attribute in ("shape_material_mu", "shape_material_mu_torsional"):
+            rows = bind(robot_view, attribute)
+            rows[:, pad] = rows[:, pad] * multipliers["fingertip_friction"].unsqueeze(1)
+        cube_rows = bind(self.cube._root_view, "shape_material_mu")
+        cube_rows.mul_(multipliers["object_friction"].unsqueeze(1))
+        # The table is a bare prim, wrapped by no view: locate its shapes by label.
+        labels = list(model.shape_label)
+        table = [None] * n
+        for index, label in enumerate(labels):
+            if "/Table/" not in label:
+                continue
+            env_index = int(label.split("/envs/env_")[1].split("/")[0])
+            table[env_index] = index
+        if any(index is None for index in table):
+            raise RuntimeError("Could not locate one table shape per environment in the Newton model")
+        table_mu = wp.to_torch(model.shape_material_mu)
+        table_index = torch.as_tensor(table, dtype=torch.long, device=table_mu.device)
+        table_mu[table_index] = table_mu[table_index] * multipliers["table_friction"].to(table_mu.device)
+        NewtonManager.add_model_change(ModelFlags.SHAPE_PROPERTIES)
+        self._friction_multipliers = multipliers
 
     def _check_kinematic_conventions(self) -> None:
         """Assert what the task-space controller rests on, once, at startup."""
@@ -1016,6 +1101,18 @@ class MotionImitationEnv(DirectRLEnv):
         cube_orientation_palm = _normalize_canonical_quaternion(
             _quat_multiply(_quat_conjugate(palm_orientation), self.canonical_cube_orientation())
         )
+        if self.domain_randomization.cube_observation_noise_enabled:
+            # What a pose estimator would report: the true pose plus per-step
+            # noise and the episode's constant offset. Rewards and terminations
+            # keep reading the true state.
+            cube_center_palm, cube_orientation_palm = perturb_cube_pose_observation(
+                cube_center_palm,
+                cube_orientation_palm,
+                self.domain_randomization.obs_cube_position_noise_m,
+                self.domain_randomization.obs_cube_orientation_noise_rad,
+                self.cube_observation_position_bias,
+                self.cube_observation_rotation_bias,
+            )
         fingertip_positions = self._fingertip_positions_world()
         fingertip_positions_palm = _quat_rotate_inverse(
             palm_orientation.unsqueeze(1).expand(-1, 5, -1), fingertip_positions - palm_position.unsqueeze(1)
@@ -1209,7 +1306,10 @@ class MotionImitationEnv(DirectRLEnv):
         randomization = self.domain_randomization
         if not randomization.impulses_enabled:
             return
+        robot_pushed = False
         if randomization.robot_impulse_probability > 0.0 and randomization.robot_impulse_n > 0.0:
+            # Arm links only: a phalanx weighs 5-45 g and the same force would
+            # launch it (see finger_impulse_n).
             self.robot_body_forces.copy_(
                 sample_impulses(
                     self.num_envs,
@@ -1217,9 +1317,25 @@ class MotionImitationEnv(DirectRLEnv):
                     randomization.robot_impulse_probability,
                     randomization.robot_impulse_n,
                     self.device,
-                    body_indices=self.robot_body_indices,
+                    body_indices=self.arm_body_indices,
                 )
             )
+            robot_pushed = True
+        if randomization.finger_impulses_enabled:
+            finger_forces = sample_impulses(
+                self.num_envs,
+                self.robot.num_bodies,
+                randomization.finger_impulse_probability,
+                randomization.finger_impulse_n,
+                self.device,
+                body_indices=self.finger_body_indices,
+            )
+            if robot_pushed:
+                self.robot_body_forces.add_(finger_forces)
+            else:
+                self.robot_body_forces.copy_(finger_forces)
+            robot_pushed = True
+        if robot_pushed:
             self.robot.instantaneous_wrench_composer.set_forces_and_torques_index(
                 forces=self.robot_body_forces, torques=torch.zeros_like(self.robot_body_forces), is_global=True
             )
@@ -1437,6 +1553,15 @@ class MotionImitationEnv(DirectRLEnv):
         self.actions[env_ids] = reset_action
         self.previous_actions[env_ids] = reset_action
         self.filtered_actions[env_ids] = reset_action
+        if self.domain_randomization.cube_observation_noise_enabled:
+            position_bias, rotation_bias = sample_cube_pose_bias(
+                count,
+                self.domain_randomization.obs_cube_position_bias_m,
+                self.domain_randomization.obs_cube_orientation_bias_rad,
+                self.device,
+            )
+            self.cube_observation_position_bias[env_ids] = position_bias
+            self.cube_observation_rotation_bias[env_ids] = rotation_bias
         self.suppress_ee_action_rate[env_ids] = True
         self.action_delay.reset(env_ids, reset_action)
         self.requested_twist[env_ids] = 0.0

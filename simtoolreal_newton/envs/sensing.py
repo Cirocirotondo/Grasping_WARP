@@ -110,3 +110,71 @@ class ActionDelay:
             self.buffer[:, env_ids] = 0.0
         else:
             self.buffer[:, env_ids] = actions.unsqueeze(0)
+
+
+def sample_cube_pose_bias(num_envs, position_bias_m, orientation_bias_rad, device, generator=None):
+    """One constant bar-pose offset per environment: ``(N, 3)`` metres, ``(N, 3)`` rotation vector.
+
+    The position offset is uniform in a cube of half-side ``position_bias_m``
+    and the rotation vector uniform in a ball of radius ``orientation_bias_rad``
+    (direction uniform on the sphere, magnitude uniform), so a pose estimator's
+    constant error is drawn once per episode and held.
+    """
+    n = int(num_envs)
+    position = (torch.rand((n, 3), device=device, generator=generator) * 2.0 - 1.0) * float(position_bias_m)
+    direction = torch.randn((n, 3), device=device, generator=generator)
+    direction = direction / direction.norm(dim=1, keepdim=True).clamp_min(1e-6)
+    magnitude = torch.rand((n, 1), device=device, generator=generator) * float(orientation_bias_rad)
+    return position, direction * magnitude
+
+
+def rotation_vector_to_quaternion(rotation_vector):
+    """``(..., 3)`` axis-angle -> ``(..., 4)`` xyzw unit quaternion (identity at zero)."""
+    angle = rotation_vector.norm(dim=-1, keepdim=True)
+    half = 0.5 * angle
+    # sin(a/2)/a -> 1/2 as a -> 0, written to stay finite at zero.
+    small = angle < 1e-6
+    scale = torch.where(small, 0.5 - angle * angle / 48.0, torch.sin(half) / angle.clamp_min(1e-12))
+    xyz = rotation_vector * scale
+    w = torch.cos(half)
+    return torch.cat((xyz, w), dim=-1)
+
+
+def perturb_cube_pose_observation(
+    position,
+    orientation_xyzw,
+    position_noise_m,
+    orientation_noise_rad,
+    position_bias=None,
+    orientation_bias=None,
+    generator=None,
+):
+    """Return the observed bar pose: true pose plus Gaussian noise and the episode bias.
+
+    ``position`` is ``(N, 3)`` and ``orientation_xyzw`` ``(N, 4)`` in whatever
+    frame the observation uses; the noise is isotropic so the frame does not
+    matter. Orientation noise is a random rotation vector with Gaussian
+    components of ``orientation_noise_rad`` each, applied on the left (a
+    perturbation of the measured frame), and the bias rotation vector the same
+    way. The returned quaternion is canonicalised (``w >= 0``).
+    """
+    from simtoolreal_newton.envs.rotations import normalize_canonical_quaternion, quat_multiply
+
+    observed_position = position
+    observed_orientation = orientation_xyzw
+    rotation_vector = torch.zeros_like(position)
+    if float(position_noise_m) > 0.0:
+        observed_position = observed_position + torch.randn(
+            position.shape, device=position.device, dtype=position.dtype, generator=generator
+        ) * float(position_noise_m)
+    if float(orientation_noise_rad) > 0.0:
+        rotation_vector = rotation_vector + torch.randn(
+            position.shape, device=position.device, dtype=position.dtype, generator=generator
+        ) * float(orientation_noise_rad)
+    if position_bias is not None:
+        observed_position = observed_position + position_bias
+    if orientation_bias is not None:
+        rotation_vector = rotation_vector + orientation_bias
+    if bool(torch.any(rotation_vector != 0.0)):
+        observed_orientation = quat_multiply(rotation_vector_to_quaternion(rotation_vector), observed_orientation)
+    return observed_position, normalize_canonical_quaternion(observed_orientation)

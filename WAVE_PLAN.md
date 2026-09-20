@@ -122,3 +122,29 @@ Seed and recipe as SC2 (widened SC1 winner, lr 5e-6, seed 42, self-collision, sc
 Closing rule: no lines after these; final summary and stop.
 ### case (SC4, 2026-09-20 01:08 CEST; GPU 0 only)
 1. `sc4_sc2w_b` then 2. `sc4_sc2w_c` — repeats of `sc2w_lr5e6_s42_a` (seed `logs/staged/w6_s7_cont2_it17000_scale/model_17000.pt`, its set_flags minus learning_rate, + scale 0.8/1.2 observed, lr 5e-6, self_collision, seed 42), budget 300 (17000→17300), ladder at 17100/17200/17300 at three scales with pose 122 everywhere, duplicates on candidates, §11 criterion. Last case lines.
+
+# Wave DR1 (2026-09-20 17:52 CEST) — domain randomization on the scale candidate, cautious mode
+
+Goal: robustness for the real robot, measured in the training simulator AND in native MuJoCo (sim2sim). Base checkpoint `logs/staged/sc2_anchor_s42_it17300/model_17300.pt` (113 obs, scale 0.8–1.2 observed with the anchor recipe, self-collision on). Its flags: `logs/staged/sc2_anchor_s42_it17300/set_flags.txt` (learning_rate filtered out; pass `--set train.algorithm.learning_rate=5e-06` explicitly). Every run also enables the ring-finger distal phalanx against the palm (`asset.self_collision_extra_pairs=[["rl_dg_4_4","wrist_3_link"]]`, in every flag file below); zero-shot on the base at 1.0 it costs nothing (grid 0.364 vs 0.356, pose 122 250/250).
+
+Families (medium level, per environment at creation; flag files in `logs/staged/dr_flags/`): `mass` (bar mass ±30%), `handpd` (hand stiffness ±30%, damping ±30%), `linkmass` (robot link mass ±30%), `friction` (fingertip sliding+torsional, bar, table ±30% each; contacts combine by max), `delay` (action delay 0..2 steps), `impulse` (bar 1 N, arm links 10 N, phalanges 0.05 N, each p=0.02/step), `cubenoise` (observed bar pose: Gaussian 5 mm / 2° per step + per-episode bias up to 5 mm / 2°), `all` (everything). 8 configurations × 3 draws (seeds 42, 7, 23) = 24 runs, lr 5e-6 everywhere, budget 400 (17300→17700), ladder every 100.
+
+Run name: `dr_<family>_s<seed>`. Launch (inside the container / on the desktop, from the repo root):
+```
+scripts/supervise_train.sh --python <PY> --run-name dr_<family>_s<seed> --target 17700 \
+  --seed-checkpoint logs/staged/sc2_anchor_s42_it17300/model_17300.pt --seed-iteration 17300 -- \
+  --num-envs 4096 --sim-device cuda:<gpu> --record-video --seed <seed> \
+  $(cat logs/staged/sc2_anchor_s42_it17300/set_flags.txt) --set train.algorithm.learning_rate=5e-06 \
+  $(cat logs/staged/dr_flags/<family>.txt)
+```
+Ladder on every rung (100, 200, 300, 400), DR OFF for the verdict (the sweep/sim2sim configs come from the run's config.json, so pass `--set domain_randomization.enabled=false` to every sweep): grid RSI 0 + pose 122 (250 repeats) at scales 0.8 / 1.0 / 1.2 (`--set object_randomization.scale_min=S --set object_randomization.scale_max=S --set object_randomization.scale_nominal_probability=0 --set object_randomization.scale_anchors=[]`), gate 7 cm computed from the rows (the config threshold is 18 cm). Candidate rung = Newton fail@7 within +0.05 of the base at every scale (base: 0.488 / 0.356 / 0.464 at 0.8 / 1.0 / 1.2) AND pose 122 ≥ 240/250 at every scale. On a candidate rung run the sim2sim verdict (CPU, ~3 min, same container): `scripts/sim2sim_grid.py --checkpoint <rung>.pt --set domain_randomization.enabled=false --newton-grid "<run dir>/sweep_grid_rsi0_<N>_s{scale}.json" --output <run dir>/sim2sim_grid25_<N>.json` and compare with the base's `logs/staged/sc2_anchor_s42_it17300/sim2sim_mujoco/grid25_baseline.json` (numbers in NIGHT_LOG once measured): hit = MuJoCo failed ≤ base at every scale and no-grasp at 1.2 ≤ base. §10 doom rule applies (orientation DQ > 0.6, two consecutive rungs worse than the base by > 0.10 at 1.0 → stop the run). A family's effect counts only if it beats the spread of its three draws.
+
+Schedule (one run per GPU, sequential per card; case GPU 1 belongs to another user — never touch it; the desktop GPU is shared with the user's viewer processes — never kill them):
+### tars
+1. GPU 0: `dr_all_s42`, `dr_cubenoise_s42`, `dr_impulse_s7`, `dr_delay_s42`, `dr_handpd_s42`, `dr_mass_s23`.
+2. GPU 1: `dr_all_s7`, `dr_cubenoise_s7`, `dr_impulse_s23`, `dr_delay_s7`, `dr_handpd_s7`, `dr_linkmass_s42`.
+### case (GPU 0 only)
+1. `dr_all_s23`, `dr_cubenoise_s23`, `dr_delay_s23`, `dr_handpd_s23`, `dr_mass_s42`, `dr_linkmass_s7`.
+### desktop
+1. `dr_friction_s42`, `dr_friction_s7`, `dr_friction_s23`, `dr_impulse_s42`, `dr_mass_s7`, `dr_linkmass_s23`.
+Closing rule: when a host's queue is exhausted, final summary in the notes file (`logs/agents/agent-<host>-dr1.md`), one closing message, stop. Candidates: stage as `logs/staged/dr_<family>_s<seed>_it<N>/` (model, config.json, set_flags.txt, sweep JSONs, sim2sim JSON) and 3–4 eval clips.

@@ -107,7 +107,9 @@ class UnappliedParametersTest(unittest.TestCase):
     """Parameters the simulator cannot write must not reach the critic."""
 
     def test_unapplied_parameters_leave_the_critic_row(self):
-        from simtoolreal_newton.envs.domain_randomization import UNAPPLIED_PARAMETERS
+        # Friction is applied on this port now (UNAPPLIED_PARAMETERS is empty);
+        # the hook still has to work for a backend that cannot write a parameter.
+        UNAPPLIED_PARAMETERS = ("fingertip_friction", "object_friction", "table_friction")
 
         dr = DomainRandomization(
             _Cfg(hand_stiffness_range=0.4, object_friction_range=0.4, critic_observes_parameters=True),

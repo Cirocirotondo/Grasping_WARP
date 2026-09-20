@@ -20,13 +20,12 @@ the population covers the range on every iteration anyway.
 import numpy as np
 
 
-# Sampled but not written to the simulator on this port: per-environment
-# friction needs solver-side material writes that Newton's MuJoCo-Warp path
-# does not expose yet. The multipliers are still drawn (so the RNG stream and
-# the other parameters match a run that has them) but they never reach the
-# critic: telling the value function that environments differ in friction
-# when they do not would be noise dressed as privilege.
-UNAPPLIED_PARAMETERS = ("fingertip_friction", "object_friction", "table_friction")
+# Parameters the environment cannot write to the simulator, if any. Friction
+# used to be here: the port now writes it per world through the same
+# ``shape_material_mu`` binding the per-episode bar scale uses (see
+# ``MotionImitationEnv._apply_domain_randomization``). Kept as the hook so a
+# backend that cannot apply a parameter says so instead of lying to the critic.
+UNAPPLIED_PARAMETERS = ()
 
 
 class DomainRandomization:
@@ -62,6 +61,40 @@ class DomainRandomization:
             getattr(cfg, "object_impulse_probability", 0.0)
         )
         self.object_impulse_n = float(getattr(cfg, "object_impulse_n", 0.0))
+        self.finger_impulse_probability = float(
+            getattr(cfg, "finger_impulse_probability", 0.0)
+        )
+        self.finger_impulse_n = float(getattr(cfg, "finger_impulse_n", 0.0))
+        self.obs_cube_position_noise_m = float(
+            getattr(cfg, "obs_cube_position_noise_m", 0.0)
+        )
+        self.obs_cube_orientation_noise_rad = float(
+            getattr(cfg, "obs_cube_orientation_noise_rad", 0.0)
+        )
+        self.obs_cube_position_bias_m = float(
+            getattr(cfg, "obs_cube_position_bias_m", 0.0)
+        )
+        self.obs_cube_orientation_bias_rad = float(
+            getattr(cfg, "obs_cube_orientation_bias_rad", 0.0)
+        )
+        for name in (
+            "robot_impulse_probability",
+            "object_impulse_probability",
+            "finger_impulse_probability",
+        ):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError("{} must lie in [0, 1]".format(name))
+        for name in (
+            "robot_impulse_n",
+            "object_impulse_n",
+            "finger_impulse_n",
+            "obs_cube_position_noise_m",
+            "obs_cube_orientation_noise_rad",
+            "obs_cube_position_bias_m",
+            "obs_cube_orientation_bias_rad",
+        ):
+            if getattr(self, name) < 0.0:
+                raise ValueError("{} cannot be negative".format(name))
         self.critic_observes_parameters = bool(
             getattr(cfg, "critic_observes_parameters", False)
         )
@@ -142,6 +175,21 @@ class DomainRandomization:
         )
 
     @property
+    def cube_observation_noise_enabled(self):
+        return self.enabled and (
+            self.obs_cube_position_noise_m > 0.0
+            or self.obs_cube_orientation_noise_rad > 0.0
+            or self.obs_cube_position_bias_m > 0.0
+            or self.obs_cube_orientation_bias_rad > 0.0
+        )
+
+    @property
+    def finger_impulses_enabled(self):
+        return self.enabled and (
+            self.finger_impulse_probability > 0.0 and self.finger_impulse_n > 0.0
+        )
+
+    @property
     def action_delay_steps(self):
         return self.action_delay_max_steps if self.enabled else 0
 
@@ -153,6 +201,7 @@ class DomainRandomization:
                 self.object_impulse_probability > 0.0
                 and self.object_impulse_n > 0.0
             )
+            or self.finger_impulses_enabled
         )
 
     def summary(self):

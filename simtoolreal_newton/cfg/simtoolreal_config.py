@@ -90,6 +90,19 @@ class SimToolRealCfg(BaseEnvCfg):
         # the object out of the hand.
         object_impulse_probability = 0.0
         object_impulse_n = 0.0
+        # Robot impulses land on the six arm links only; the phalanges weigh
+        # 5-45 g and get their own, much lighter, budget below (10 N for one
+        # 60 Hz step on a 5 g phalanx would be 33 m/s).
+        finger_impulse_probability = 0.0
+        finger_impulse_n = 0.0
+        # Error on the bar the policy observes (centre and rotation in the
+        # palm frame): per-step Gaussian noise plus a constant per-episode
+        # bias standing in for a pose estimator's offset. Observation only;
+        # rewards and terminations read the true state.
+        obs_cube_position_noise_m = 0.0
+        obs_cube_orientation_noise_rad = 0.0
+        obs_cube_position_bias_m = 0.0
+        obs_cube_orientation_bias_rad = 0.0
         # Feed the sampled multipliers to the critic. Only possible on a run
         # trained from scratch: it widens the critic input, so no existing value
         # network can be warm-started into it. Without this the value function
@@ -225,6 +238,10 @@ class SimToolRealCfg(BaseEnvCfg):
         self_collision_with_palm = False
         # True also lets non-adjacent links of the same finger collide.
         self_collision_same_finger = False
+        # Named body pairs opened on top of the rules above, e.g.
+        # [["rl_dg_4_4", "wrist_3_link"]]: the ring finger's distal phalanx
+        # against the merged palm, which the SC-era policies curl into.
+        self_collision_extra_pairs = []
         friction = 0.5
         # 1.5 under PhysX, whose default combine mode averages the two
         # materials of a contact: fingertip 1.5 with cuboid 0.5 acted as 1.0.

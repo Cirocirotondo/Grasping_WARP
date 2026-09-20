@@ -43,6 +43,21 @@ def _settings(asset_cfg):
     )
 
 
+def extra_pairs(asset_cfg) -> set:
+    """``asset.self_collision_extra_pairs``: named body pairs opened on top of the rules.
+
+    Each entry is a two-element list of body names, e.g.
+    ``[["rl_dg_4_4", "wrist_3_link"]]`` lets the ring finger's distal phalanx
+    (with its merged tip) touch the palm without opening every palm pair.
+    """
+    pairs = set()
+    for entry in list(getattr(asset_cfg, "self_collision_extra_pairs", []) or []):
+        if len(entry) != 2 or entry[0] == entry[1]:
+            raise ValueError("self_collision_extra_pairs entries must name two different bodies: {!r}".format(entry))
+        pairs.add(frozenset((str(entry[0]), str(entry[1]))))
+    return pairs
+
+
 def allowed_body_pairs(asset_cfg, body_names: Iterable[str]) -> set:
     """``{frozenset({body_a, body_b})}`` allowed to collide, both bodies present.
 
@@ -76,6 +91,11 @@ def allowed_body_pairs(asset_cfg, body_names: Iterable[str]) -> set:
                 # links a curl can fold onto each other are worth a contact.
                 if lb - la >= 2:
                     add(finger_body_name(f, la), finger_body_name(f, lb))
+    for pair in extra_pairs(asset_cfg):
+        a, b = tuple(pair)
+        if a not in present or b not in present:
+            raise ValueError("self_collision_extra_pairs names an unknown body: {!r}".format(sorted(pair)))
+        add(a, b)
     return allowed
 
 
