@@ -59,9 +59,16 @@ class ActionPipeline:
         self.rotation_speed = float(control.arm_rotation_speed_rad_per_s)
         self.ik_damping = float(control.ik_damping)
         self.ik_max_delta = float(control.ik_max_joint_delta_rad)
-        delay = int(getattr(getattr(env_cfg, "domain_randomization", None), "action_delay_max_steps", 0) or 0)
-        if delay:
-            raise ValueError("Action delay is not supported by the sim2sim runner")
+        # The delay is a domain-randomization family: it only exists when the
+        # master switch is on (as in the training env), so an evaluation with
+        # ``domain_randomization.enabled=false`` runs without it.
+        randomization = getattr(env_cfg, "domain_randomization", None)
+        delay = int(getattr(randomization, "action_delay_max_steps", 0) or 0)
+        if delay and bool(getattr(randomization, "enabled", False)):
+            raise ValueError(
+                "Action delay is not supported by the sim2sim runner; evaluate with "
+                "--set domain_randomization.enabled=false"
+            )
         self.lower = torch.as_tensor(np.asarray(lower_limits, dtype=np.float32)).reshape(1, ACTION_DIM)
         self.upper = torch.as_tensor(np.asarray(upper_limits, dtype=np.float32)).reshape(1, ACTION_DIM)
         slew = torch.as_tensor(np.asarray(velocity_limits, dtype=np.float32)).reshape(1, ACTION_DIM) * self.dt
