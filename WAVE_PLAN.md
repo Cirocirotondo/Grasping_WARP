@@ -148,3 +148,15 @@ Schedule (one run per GPU, sequential per card; case GPU 1 belongs to another us
 ### desktop
 1. `dr_friction_s42`, `dr_friction_s7`, `dr_friction_s23`, `dr_impulse_s42`, `dr_mass_s7`, `dr_linkmass_s23`.
 Closing rule: when a host's queue is exhausted, final summary in the notes file (`logs/agents/agent-<host>-dr1.md`), one closing message, stop. Candidates: stage as `logs/staged/dr_<family>_s<seed>_it<N>/` (model, config.json, set_flags.txt, sweep JSONs, sim2sim JSON) and 3–4 eval clips.
+
+### Coda finale (2026-09-21 11:46 CEST)
+
+Criterio di verdetto aggiornato dall'utente: il tracking del braccio può peggiorare un po'; conta che la policy arrivi in fondo, cioè sollevi l'oggetto e lo tenga in mano. Le colonne decisive restano quindi posa 122 (≥ 240/250 a ogni scala), griglia Newton entro +0.05 della base e MuJoCo grid25 (fallite ≤ base, mancate prese a 1.2 ≤ base); il tracking è informativo, non un gate. Sotto questo criterio i due hit cubenoise (s42/17400, s7/17500) restano hit.
+
+La coda di case si è fermata il 20/09 alle 18:38 (solo dr_all_s23 completata, famiglia all chiusa 3/3 senza candidato); su case ora anche la GPU 0 è occupata da un altro utente. Le run mancanti girano su tars con budget +200 (target 17500, ladder 17400/17500) tramite `logs/agents/dr1_tools/dr2_queue.sh`:
+
+- GPU 0: dr_cubenoise_s23, dr_linkmass_s7, dr_mass_s42
+- GPU 1: dr_combo_s42, dr_combo_s7, dr_handpd_s23 (combo = cubenoise + impulse + linkmass, `logs/staged/dr_flags/combo.txt`)
+- saltata dr_delay_s23 (famiglia chiusa 2/2 come puro costo senza robustezza)
+
+Risultati per run in `logs/staged/<run>_ladder/` (sweep Newton, model_17400/17500, sim2sim_grid25_<N>.json); righe di stato in `logs/agents/dr1_tools/queue_gpu{0,1}.log`.
