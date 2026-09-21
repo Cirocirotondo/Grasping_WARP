@@ -161,7 +161,7 @@ La coda di case si è fermata il 20/09 alle 18:38 (solo dr_all_s23 completata, f
 
 Risultati per run in `logs/staged/<run>_ladder/` (sweep Newton, model_17400/17500, sim2sim_grid25_<N>.json); righe di stato in `logs/agents/dr1_tools/queue_gpu{0,1}.log`.
 
-### Verdetto finale DR1 (2026-09-21 13:50 CEST)
+### Verdetto finale DR1 (2026-09-21 13:49 CEST)
 
 26 run (24 della griglia cauta, 2 combo) più una continuazione, base `sc2_anchor_s42/17300`, lr 5e-6. Criterio finale (utente): la policy deve sollevare e tenere fino alla fine; il tracking del braccio può peggiorare. Colonne decisive: posa 122 ≥ 240/250 a ogni scala, MuJoCo grid25 fallite ≤ base (15/17/20) e mancate prese ≤ base (8/5/10).
 
