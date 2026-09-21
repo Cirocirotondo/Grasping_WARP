@@ -160,3 +160,25 @@ La coda di case si è fermata il 20/09 alle 18:38 (solo dr_all_s23 completata, f
 - saltata dr_delay_s23 (famiglia chiusa 2/2 come puro costo senza robustezza)
 
 Risultati per run in `logs/staged/<run>_ladder/` (sweep Newton, model_17400/17500, sim2sim_grid25_<N>.json); righe di stato in `logs/agents/dr1_tools/queue_gpu{0,1}.log`.
+
+### Verdetto finale DR1 (2026-09-21 13:50 CEST)
+
+26 run (24 della griglia cauta, 2 combo) più una continuazione, base `sc2_anchor_s42/17300`, lr 5e-6. Criterio finale (utente): la policy deve sollevare e tenere fino alla fine; il tracking del braccio può peggiorare. Colonne decisive: posa 122 ≥ 240/250 a ogni scala, MuJoCo grid25 fallite ≤ base (15/17/20) e mancate prese ≤ base (8/5/10).
+
+| checkpoint | Newton fail@7 0.8/1.0/1.2 (base 0.488/0.356/0.464) | posa 122 | MuJoCo fallite | MuJoCo mancate prese | palmo (base 0.029 m) | verdetto |
+|---|---|---|---|---|---|---|
+| dr_combo_s7/17500 | 0.528/0.444/0.264 | 250/250/250 | 9/10/14 | 4/3/3 | 0.045 | **hit, in testa** |
+| dr_combo_s42/17400 | 0.492/0.448/0.428 | 250/250/250 | 13/12/15 | 4/4/5 | 0.043 | hit |
+| dr_cubenoise_s23/17500 | 0.524/0.420/0.352 | 250/250/250 | 14/11/16 | 0/1/1 | 0.051 | hit |
+| dr_cubenoise_s42/17400 | 0.384/0.356/0.400 | 250/250/250 | 14/11/16 | 4/3/3 | 0.045 | hit |
+| dr_cubenoise_s7/17500 | 0.520/0.320/0.220 | 250/250/250 | 13/11/15 | 2/2/5 | 0.044 | hit |
+| dr_impulse_s42/17400 | 0.364/0.296/0.300 | 247/249/247 | 16/15/18 | 5/5/11 | 0.025 | near-hit, tracking pulito |
+| dr_linkmass_s42/17400 | 0.352/0.356/0.448 | 240+/–/155 | 14/11/16 | –/–/8 | 0.026 | near-hit, posa a 1.2 |
+| dr_handpd_s7/17400 | 0.456/0.316/0.436 | 234/218/45 | 18/13/17 | 7/5/5 | 0.029 | near-hit, posa |
+| dr_handpd_s23/17400 | 0.504/0.464/0.456 | 250/250/250 | 18/16/16 | 5/4/4 | – | tiene, griglia debole |
+
+Famiglie senza candidato: all 0/3, mass 0/3, delay 0/2, friction (near-hit s42 solo), impulse s7/s23, linkmass s7/s23, handpd s42. Continuazione combo_s7 17500→17700: crollo (posa 41/64/59 a 17600, orientamento fino a 0.66 a 17700).
+
+Lezioni: (1) il gradino utile è +100/+200 per ogni ricetta, combo compresa; (2) il seme conta più della famiglia (friction, linkmass, handpd: una estrazione buona su tre); (3) il rumore di osservazione del cubo è la sola famiglia che produce robustezza ripetibile (3/3) e la ricetta combinata la migliora in MuJoCo; (4) la robustezza comprata con rumore di osservazione costa 30–75% di errore del palmo, quella dinamica no, ma il sollevamento e l'orizzonte restano intatti; (5) in Newton fail@7 confonde errore di tracking 7–10 cm con oggetti persi: fail@15 e le mancate prese MuJoCo sono le colonne che misurano "solleva e tiene".
+
+Pacchetti: `logs/staged/dr_<run>_ladder/` (model_17400/17500, config, sweep Newton, sim2sim_grid25_<N>.json, eval_rsi0_*.json tracking, eval_videos/ per i candidati), oltre ai `logs/staged/dr_*_it*` della prima parte.
