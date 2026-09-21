@@ -309,6 +309,7 @@
   table.sweeps { font-size: 12px; white-space: nowrap; }
   table.sweeps th, table.sweeps td { padding-right: 12px; }
   table.sweeps td.k { white-space: normal; }
+  table.sweeps tr.baseline td { color: var(--muted); font-weight: 500; }
   @media (max-width: 560px) {
     table.facts td.k, table.facts td.v { display: block; width: auto; }
     table.facts td.k { border-bottom: 0; padding-bottom: 1px; }
@@ -858,6 +859,9 @@ function runCard(run, lead) {
   if (run.sweeps && run.sweeps.length) {
     card.appendChild(sweepBlock(run, lead));
   }
+  if (run.sim2sim && run.sim2sim.length) {
+    card.appendChild(sim2simBlock(run, lead));
+  }
   if (run.eval_videos && run.eval_videos.length) {
     card.appendChild(evalVideoBlock(run, lead));
   }
@@ -928,6 +932,72 @@ function sweepBlock(run, open) {
     + (first && first.episodes ? " · " + first.episodes + " placements" : "")
     + (first && (first.bank_index !== null && first.bank_index !== undefined)
         ? " · bank pose " + first.bank_index : "");
+  inner.appendChild(note);
+  details.appendChild(inner);
+  return details;
+}
+
+/* The sim2sim verdict: the same 25 placements replayed in native MuJoCo at
+   three bar scales, with the base policy's row under each scale. "no grasp"
+   is the column that separates a tracking error from a dropped bar, which is
+   what wave DR1 was finally judged on. */
+function sim2simBlock(run, open) {
+  const details = el("details");
+  if (open) details.open = true;
+  details.appendChild(summary("MuJoCo sim2sim (" + run.sim2sim.length + ")"));
+  const inner = el("div", "details-body");
+  const table = el("table", "sweeps");
+  const head = el("tr");
+  ["checkpoint", "scale"].forEach((name) => head.appendChild(el("th", null, name)));
+  DATA.sim2sim_fields.forEach((field) => head.appendChild(el("th", null, field.label)));
+  table.appendChild(head);
+  const baseAt = (scale) => {
+    const rows = (DATA.sim2sim_baseline && DATA.sim2sim_baseline.scales) || [];
+    return rows.find((row) => Math.abs(row.scale - scale) < 1e-6) || null;
+  };
+  run.sim2sim.forEach((grid) => {
+    grid.scales.forEach((row, index) => {
+      const tr = el("tr");
+      tr.appendChild(el("td", "k", index === 0 ? grid.checkpoint : ""));
+      tr.appendChild(el("td", "v", row.scale.toFixed(1)));
+      const base = baseAt(row.scale);
+      DATA.sim2sim_fields.forEach((field) => {
+        const value = row.summary[field.key];
+        let tone = "";
+        if ((field.key === "failed" || field.key === "no_grasp")
+            && value !== null && value !== undefined && base) {
+          const reference = base.summary[field.key];
+          if (reference !== null && reference !== undefined) {
+            tone = value <= reference ? " good" : " bad";
+          }
+        }
+        tr.appendChild(el("td", "v" + tone,
+          value === null || value === undefined ? "—" : fmt(value * field.scale, field.digits)));
+      });
+      table.appendChild(tr);
+    });
+  });
+  if (DATA.sim2sim_baseline) {
+    DATA.sim2sim_baseline.scales.forEach((row, index) => {
+      const tr = el("tr", "baseline");
+      tr.appendChild(el("td", "k", index === 0 ? "base" : ""));
+      tr.appendChild(el("td", "v", row.scale.toFixed(1)));
+      DATA.sim2sim_fields.forEach((field) => {
+        const value = row.summary[field.key];
+        tr.appendChild(el("td", "v",
+          value === null || value === undefined ? "—" : fmt(value * field.scale, field.digits)));
+      });
+      table.appendChild(tr);
+    });
+  }
+  const scroller = el("div", "scroll-x");
+  scroller.appendChild(table);
+  inner.appendChild(scroller);
+  const note = el("p", "eyebrow");
+  const first = run.sim2sim[0];
+  note.textContent = "scripts/sim2sim_grid.py · native MuJoCo replay of the Newton grid, DR off"
+    + (first && first.placements ? " · " + first.placements + " placements per scale" : "")
+    + (DATA.sim2sim_baseline ? " · base rows: " + DATA.sim2sim_baseline.label : "");
   inner.appendChild(note);
   details.appendChild(inner);
   return details;

@@ -163,6 +163,29 @@ SWEEP_FIELDS = [
     ("blown_count", "blown", 0, 1.0),
 ]
 
+# The sim2sim verdict scripts/sim2sim_grid.py writes: the same 25 placements
+# replayed in native MuJoCo at three bar scales, DR switched off. "failed" and
+# "no grasp" are the two columns wave DR1 was closed on, so the base policy's
+# numbers are loaded next to them.
+SIM2SIM_FIELDS = [
+    ("failed", "failed", 0, 1.0),
+    ("no_grasp", "no grasp", 0, 1.0),
+    ("median_max_object_error_m", "med err cm", 1, 100.0),
+    ("blown", "blown", 0, 1.0),
+    ("newton_failed", "Newton failed", 0, 1.0),
+    ("agreement", "agree", 0, 1.0),
+]
+# The wave DR1 reference: the base checkpoint's own MuJoCo grid.
+SIM2SIM_BASELINE = (
+    REPO_ROOT
+    / "logs"
+    / "staged"
+    / "sc2_anchor_s42_it17300"
+    / "sim2sim_mujoco"
+    / "grid25_baseline.json"
+)
+SIM2SIM_BASELINE_LABEL = "sc2_anchor_s42 model_17300 (wave DR1 base)"
+
 # Fields whose value is per-run noise rather than an experiment choice.
 IGNORED_CONFIG_PATHS = {
     "env.num_envs",
@@ -594,6 +617,84 @@ def load_sweeps(run_dir):
         )
     sweeps.sort(key=lambda item: (-item["order"], item["file"]))
     return sweeps
+
+
+def _sim2sim_scales(payload):
+    """[{scale, summary}] for one sim2sim grid file, small bar first."""
+    scales = payload.get("scales")
+    if not isinstance(scales, dict):
+        return []
+    rows = []
+    for name, entry in scales.items():
+        try:
+            scale = float(name)
+        except (TypeError, ValueError):
+            continue
+        summary = (entry or {}).get("summary")
+        if not isinstance(summary, dict):
+            continue
+        values = {}
+        for key, _, _, _ in SIM2SIM_FIELDS:
+            value = summary.get(key)
+            values[key] = (
+                float(value)
+                if isinstance(value, (int, float)) and math.isfinite(value)
+                else None
+            )
+        values["count"] = summary.get("count")
+        rows.append({"scale": scale, "summary": values})
+    rows.sort(key=lambda row: row["scale"])
+    return rows
+
+
+def load_sim2sim(run_dir):
+    """The native-MuJoCo verdicts sitting next to a run, newest checkpoint first.
+
+    scripts/sim2sim_grid.py replays the Newton grid in MuJoCo: "failed" counts
+    the placements whose bar left the criterion, "no grasp" the ones never
+    lifted at all. That second column is what tells a tracking error from a
+    dropped object, which the Newton fail@7 column cannot.
+    """
+    runs = []
+    for path in sorted(run_dir.glob("sim2sim_grid25_*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (ValueError, OSError):
+            continue
+        scales = _sim2sim_scales(payload)
+        if not scales:
+            continue
+        # The iteration is the trailing number: "sim2sim_grid25_17500" is the
+        # 25-placement grid of model_17500, not of model_25.
+        match = re.search(r"_(\d+)$", path.stem)
+        order = int(match.group(1)) if match else -1
+        runs.append(
+            {
+                "file": path.name,
+                "checkpoint": "it {}".format(order) if order >= 0 else path.stem,
+                "order": order,
+                "placements": len(payload.get("placements") or []),
+                "scales": scales,
+            }
+        )
+    runs.sort(key=lambda item: (-item["order"], item["file"]))
+    return runs
+
+
+def sim2sim_baseline():
+    """The base checkpoint's MuJoCo grid, or None when it is not staged here."""
+    if not SIM2SIM_BASELINE.is_file():
+        return None
+    try:
+        with SIM2SIM_BASELINE.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (ValueError, OSError):
+        return None
+    scales = _sim2sim_scales(payload)
+    if not scales:
+        return None
+    return {"label": SIM2SIM_BASELINE_LABEL, "scales": scales}
 
 
 # --------------------------------------------------------------------------
@@ -1091,6 +1192,7 @@ def build_run(run_dir, defaults, args, featured, budget_bytes, figure_budget_byt
         "best_checkpoint": (run_dir / "best_model.pt").is_file(),
         "supervisor_done": supervisor_done(run_dir),
         "sweeps": load_sweeps(run_dir),
+        "sim2sim": load_sim2sim(run_dir),
         "featured": featured,
         "videos": [],
         "video_bytes": 0,
@@ -1189,7 +1291,7 @@ def main():
         figure_budget -= run["figure_bytes"]
         runs.append(run)
         print(
-            "  {:<52} {:<8} it {:>6} {:<9} {} clips {} plots {} sweeps".format(
+            "  {:<52} {:<8} it {:>6} {:<9} {} clips {} plots {} sweeps {} sim2sim".format(
                 run["id"][:52],
                 run["host"],
                 run["iteration"],
@@ -1197,6 +1299,7 @@ def main():
                 len(run["videos"]) + len(run["eval_videos"]),
                 len(run["eval_figures"]),
                 len(run["sweeps"]),
+                len(run["sim2sim"]),
             )
         )
 
@@ -1228,6 +1331,11 @@ def main():
             {"key": key, "label": label, "digits": digits, "scale": scale}
             for key, label, digits, scale in SWEEP_FIELDS
         ],
+        "sim2sim_fields": [
+            {"key": key, "label": label, "digits": digits, "scale": scale}
+            for key, label, digits, scale in SIM2SIM_FIELDS
+        ],
+        "sim2sim_baseline": sim2sim_baseline(),
         "runs": runs,
     }
 
