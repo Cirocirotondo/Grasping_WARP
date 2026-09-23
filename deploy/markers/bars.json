@@ -1,0 +1,33 @@
+{
+ "dictionary": "tag36h11",
+ "bars": {
+  "cuboid_4x4x12": {
+   "scale": 0.8,
+   "size_m": [
+    0.12,
+    0.04,
+    0.04
+   ],
+   "ids": [
+    100,
+    113
+   ],
+   "tag_mm": 32.0,
+   "board": "cuboid_4x4x12.json"
+  },
+  "cuboid_6x6x18": {
+   "scale": 1.2,
+   "size_m": [
+    0.18,
+    0.06,
+    0.06
+   ],
+   "ids": [
+    200,
+    213
+   ],
+   "tag_mm": 48.0,
+   "board": "cuboid_6x6x18.json"
+  }
+ }
+}
