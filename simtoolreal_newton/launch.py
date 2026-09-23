@@ -37,6 +37,44 @@ def add_env_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _bind_space_to_simulation_pause() -> None:
+    """Rebind the viewer's space bar from pausing rendering to pausing the simulation.
+
+    Newton binds space to ``ViewerGL._paused``, which only stops the viewer
+    from drawing: Isaac Lab keeps calling ``env.step`` behind the frozen
+    window, so releasing the pause reveals a policy and a robot that ran on
+    without us. The pause that actually blocks the loop is Isaac Lab's
+    ``_paused_training`` -- ``SimulationContext.update_visualizers`` spins on
+    ``is_training_paused()`` until it clears -- and it is otherwise reachable
+    only through the "Pause Simulation" button in the side panel.
+
+    Patched on the class rather than the instance, and before any viewer
+    exists: ``ViewerGL.__init__`` registers ``self.on_key_press`` as a bound
+    method, so a patch applied after construction would never be called.
+    """
+    try:
+        import pyglet
+        from isaaclab_visualizers.newton.newton_visualizer import NewtonViewerGL
+    except Exception:  # visualizer extras absent, or a non-GL backend
+        return
+    if getattr(NewtonViewerGL, "_simtoolreal_space_pauses_sim", False):
+        return
+
+    inherited = NewtonViewerGL.on_key_press
+
+    def on_key_press(self, symbol, modifiers):
+        if symbol == pyglet.window.key.SPACE:
+            # Mirrors the guard in the method we are replacing: a space typed
+            # into an ImGui text field belongs to the field.
+            if not self.ui.is_capturing():
+                self._paused_training = not self._paused_training
+            return
+        inherited(self, symbol, modifiers)
+
+    NewtonViewerGL.on_key_press = on_key_press
+    NewtonViewerGL._simtoolreal_space_pauses_sim = True
+
+
 def make_env(
     animrl_cfg,
     num_envs: Optional[int] = None,
@@ -76,6 +114,8 @@ def make_env(
     }
     stack = contextlib.ExitStack()
     stack.enter_context(launch_simulation(env_cfg, launcher_args))
+    if visualizer is not None and str(visualizer).startswith("newton"):
+        _bind_space_to_simulation_pause()
     try:
         env = MotionImitationEnv(env_cfg)
     except Exception:
